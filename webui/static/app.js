@@ -194,6 +194,7 @@ $$(".tab").forEach((t) => {
     $("#tab-" + t.dataset.tab).classList.remove("hidden");
     if (t.dataset.tab === "registered") refreshRegistered();
     if (t.dataset.tab === "runs") refreshRuns();
+    if (t.dataset.tab === "mailcfg") loadMailConfig();
   });
 });
 
@@ -885,6 +886,75 @@ function _bindAutoSave() {
     el.addEventListener("change", _saveForm);
   }
 }
+
+// ──────────────────────── 📧 邮箱配置 ────────────────────────
+
+function _syncCfFields(source) {
+  $("#cfTempCfg").classList.toggle("hidden", source !== "cf_temp");
+}
+
+async function loadMailConfig() {
+  try {
+    const { config } = await api("/api/settings/mail");
+    const src = config.mail_source || "outlook";
+    const radio = document.querySelector(`input[name="mailSource"][value="${src}"]`);
+    if (radio) radio.checked = true;
+    _syncCfFields(src);
+    $("#cfApiUrl").value = config.cf_api_url || "";
+    $("#cfDomain").value = config.cf_domain || "";
+    $("#cfAdminToken").value = "";
+    if (config.cf_admin_token === "***") {
+      $("#cfAdminToken").placeholder = "已设置（留空不修改）";
+    } else {
+      $("#cfAdminToken").placeholder = "Worker 配置的 ADMIN_PASSWORDS";
+    }
+  } catch (e) {
+    console.error("loadMailConfig:", e);
+  }
+}
+
+// radio 切换显隐
+document.querySelectorAll("input[name='mailSource']").forEach(r => {
+  r.addEventListener("change", () => _syncCfFields(r.value));
+});
+
+$("#btnSaveMailCfg").addEventListener("click", async () => {
+  const source = document.querySelector("input[name='mailSource']:checked")?.value || "outlook";
+  const isCf = source === "cf_temp";
+  const body = {
+    mail_source:    source,
+    cf_api_url:     isCf ? $("#cfApiUrl").value.trim() : "",
+    cf_admin_token: isCf ? ($("#cfAdminToken").value.trim() || "***") : "***",
+    cf_domain:      isCf ? $("#cfDomain").value.trim() : "",
+  };
+  try {
+    await api("/api/settings/mail", { method: "POST", body: JSON.stringify(body) });
+    $("#mailCfgResult").textContent = "✅ 保存成功";
+    $("#mailCfgResult").className = "result ok";
+  } catch (e) {
+    $("#mailCfgResult").textContent = "❌ " + e.message;
+    $("#mailCfgResult").className = "result bad";
+  }
+  setTimeout(() => { $("#mailCfgResult").textContent = ""; }, 3000);
+});
+
+$("#btnTestMail").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = "⏳ 测试中...";
+  $("#mailCfgResult").textContent = "";
+  try {
+    const r = await api("/api/settings/mail/test", { method: "POST" });
+    $("#mailCfgResult").textContent = "✅ " + r.message;
+    $("#mailCfgResult").className = "result ok";
+  } catch (err) {
+    $("#mailCfgResult").textContent = "❌ " + err.message;
+    $("#mailCfgResult").className = "result bad";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔌 测试 CF 连通性";
+  }
+});
 
 // ──────────────────────── 启动 ────────────────────────
 

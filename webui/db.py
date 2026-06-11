@@ -43,6 +43,11 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_outlook_status ON outlook_accounts(status);
 
+        CREATE TABLE IF NOT EXISTS settings (
+            key     TEXT PRIMARY KEY,
+            value   TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS registered (
             email           TEXT PRIMARY KEY,
             password        TEXT,
@@ -507,6 +512,60 @@ def list_runs(limit: int = 50) -> list[dict]:
         "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,),
     )
     return [dict(r) for r in cur.fetchall()]
+
+
+# ──────────────────────── settings (KV) ────────────────────────
+
+
+def get_setting(key: str, default: str = "") -> str:
+    con = _conn()
+    cur = con.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value) -> None:
+    with _lock:
+        con = _conn()
+        con.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        con.commit()
+
+
+# ──────────────────────── 邮箱来源配置 ────────────────────────
+
+
+def get_mail_config() -> dict:
+    """返回邮箱来源配置（admin_token 隐藏明文）。"""
+    return {
+        "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp
+        "cf_api_url":    get_setting("cf_api_url", ""),
+        "cf_admin_token": "***" if get_setting("cf_admin_token") else "",
+        "cf_domain":     get_setting("cf_domain", ""),
+    }
+
+
+def save_mail_config(data: dict) -> None:
+    """保存邮箱配置。admin_token 传 '***' 表示不修改。"""
+    if "mail_source" in data:
+        src = str(data["mail_source"]).strip().lower()
+        if src not in ("outlook", "cf_temp"):
+            src = "outlook"
+        set_setting("mail_source", src)
+    if "cf_api_url" in data:
+        set_setting("cf_api_url", str(data["cf_api_url"]).strip())
+    if "cf_domain" in data:
+        set_setting("cf_domain", str(data["cf_domain"]).strip())
+    if data.get("cf_admin_token") and data["cf_admin_token"] != "***":
+        set_setting("cf_admin_token", str(data["cf_admin_token"]).strip())
+
+
+def get_cf_admin_token() -> str:
+    """内部用：拿明文 admin_token。"""
+    return get_setting("cf_admin_token", "")
 
 
 # 模块加载时自动建表

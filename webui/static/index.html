@@ -94,6 +94,7 @@
       <button class="tab active" data-tab="pool">号池</button>
       <button class="tab" data-tab="registered">注册结果</button>
       <button class="tab" data-tab="runs">运行记录</button>
+      <button class="tab" data-tab="mailcfg">📧 邮箱配置</button>
     </div>
 
     <div class="tab-content" id="tab-pool">
@@ -158,6 +159,50 @@
         <thead><tr><th>run_id</th><th>邮箱</th><th>状态</th><th>开始时间</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+
+    <div class="tab-content hidden" id="tab-mailcfg">
+      <h3 style="margin:0 0 12px;color:var(--pink-dark)">📧 邮箱来源配置</h3>
+      <p class="hint">
+        OpenAI 注册需要邮箱收 OTP。可选 Outlook 接码池（从号池 claim），
+        或者用主人自己的 CF Worker 自建 catch-all 邮箱
+        (<a href="https://github.com/dreamhunter2333/cloudflare_temp_email" target="_blank" rel="noopener" class="brand-link">cloudflare_temp_email</a>)。
+      </p>
+      <div class="form">
+        <fieldset>
+          <legend>邮箱来源</legend>
+          <label class="check">
+            <input type="radio" name="mailSource" value="outlook" id="msOutlook">
+            Outlook 接码池 <small>（从号池 claim 一个 outlook 号注册）</small>
+          </label>
+          <label class="check">
+            <input type="radio" name="mailSource" value="cf_temp" id="msCfTemp">
+            CF Temp Email <small>（cloudflare_temp_email 自建 catch-all）</small>
+          </label>
+        </fieldset>
+
+        <div id="cfTempCfg" class="hidden">
+          <label>API URL <small>（Worker 部署地址，如 https://mail.example.com）</small>
+            <input id="cfApiUrl" placeholder="https://mail.example.com">
+          </label>
+          <label>Admin Token <small>（Worker 环境变量 ADMIN_PASSWORDS）</small>
+            <input id="cfAdminToken" placeholder="留空表示不修改（已设置）" type="password">
+          </label>
+          <label>Catch-all 域名 <small>（如 example.com，邮件会发到 xxx@example.com）</small>
+            <input id="cfDomain" placeholder="example.com">
+          </label>
+          <p class="hint">
+            ⚠️ 主人需要在 Cloudflare Email Routing 配置 catch-all 转发到 Worker，
+            否则随机邮箱地址收不到 OpenAI 邮件。
+          </p>
+        </div>
+
+        <div class="row">
+          <button id="btnSaveMailCfg" class="primary">💾 保存配置</button>
+          <button id="btnTestMail">🔌 测试 CF 连通性</button>
+          <span id="mailCfgResult" class="result"></span>
+        </div>
+      </div>
     </div>
   </section>
 

@@ -130,6 +130,8 @@ def _do_register(
 
     email = account["email"]
     saved_env = {}
+    # 提前读取，避免在 try 块前异常时 except 引用未定义
+    mail_source = db.get_setting("mail_source", "outlook")
 
     try:
         # 注入环境变量（不污染全局，跑完恢复）
@@ -152,12 +154,34 @@ def _do_register(
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
-        mail = OutlookMailProvider(
-            email=account["email"],
-            password=account.get("password", ""),
-            client_id=account["client_id"],
-            refresh_token=account["refresh_token"],
-        )
+        # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all ─
+        if mail_source == "cf_temp":
+            sys_path_root = str(ROOT)
+            if sys_path_root not in sys.path:
+                sys.path.insert(0, sys_path_root)
+            from mail_cf import CFTempEmailProvider
+
+            api_url = db.get_setting("cf_api_url", "")
+            domain  = db.get_setting("cf_domain", "")
+            token   = db.get_cf_admin_token()
+            if not api_url or not domain or not token:
+                raise RuntimeError(
+                    "CF Temp Email 未配置完整（缺 api_url / domain / admin_token），"
+                    "请去「邮箱配置」Tab 填写"
+                )
+            mail = CFTempEmailProvider(
+                api_url=api_url, admin_token=token, domain=domain,
+            )
+            logging.getLogger("registrar").info(
+                f"[register] 邮箱来源: cf_temp / domain={domain}"
+            )
+        else:
+            mail = OutlookMailProvider(
+                email=account["email"],
+                password=account.get("password", ""),
+                client_id=account["client_id"],
+                refresh_token=account["refresh_token"],
+            )
 
         flow = AuthFlow(cfg)
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
@@ -212,7 +236,9 @@ def _do_register(
 
         # 落库
         db.save_registered(d)
-        db.mark_done(email)
+        # CF 模式下 email 是虚拟占位（cf_placeholder_XXX@cf.local），不操作号池
+        if mail_source != "cf_temp":
+            db.mark_done(email)
 
         result_summary = {
             "email": d.get("email"),
@@ -235,13 +261,15 @@ def _do_register(
         category = classify_error(err)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
         logging.getLogger("registrar").error(traceback.format_exc())
-        if category == "network":
-            db.release_unused(email)
-            logging.getLogger("registrar").warning(
-                f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
-            )
-        else:
-            db.mark_failed(email, f"[{category}] {err}")
+        # CF 模式下不操作号池
+        if mail_source != "cf_temp":
+            if category == "network":
+                db.release_unused(email)
+                logging.getLogger("registrar").warning(
+                    f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
+                )
+            else:
+                db.mark_failed(email, f"[{category}] {err}")
         db.finish_run(run_id, "failed", err, category=category)
         _emit_status(run_id, "error", {"message": err, "category": category})
 

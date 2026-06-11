@@ -284,8 +284,15 @@ class AutoLoopController:
                 if self._stop_event.is_set():
                     return
 
-            # claim 下一个号
-            account = db.claim_next()
+            # claim 下一个号（CF 模式用虚拟占位，无需 outlook 号池）
+            mail_source = db.get_setting("mail_source", "outlook")
+            if mail_source == "cf_temp":
+                account = {
+                    "email": f"cf_placeholder_{int(time.time())}_{worker_id}@cf.local",
+                    "password": "", "client_id": "", "refresh_token": "",
+                }
+            else:
+                account = db.claim_next()
             if not account:
                 idle_round += 1
                 if idle_round == 1:
@@ -314,7 +321,8 @@ class AutoLoopController:
                 run_id = registrar.start_registration(account, run_options)
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
-                db.release_unused(account["email"])
+                if mail_source != "cf_temp":
+                    db.release_unused(account["email"])
                 time.sleep(2)
                 continue
 

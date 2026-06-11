@@ -9,7 +9,22 @@
 **完全无浏览器**：用 `curl_cffi` 模拟 TLS 指纹 + 纯 Python/QuickJS 解 OpenAI Sentinel PoW + IMAP XOAUTH2 取 OTP，直接走 OpenAI authorize 状态机。
 
 含轻量级 **WebUI**：批量导入号池、可视化触发注册、实时 SSE 日志、凭证一键复制。
-不含支付、daemon、CF Email Worker、catch-all、Camoufox、Playwright。
+**邮箱来源支持双模式**：Outlook 接码池 + CF Worker 自建 catch-all（`cloudflare_temp_email`）。
+不含支付、daemon、Camoufox、Playwright。
+
+## 📰 最近更新（2026-06）
+
+- ✨ **CF Temp Email 自建邮箱支持**
+  - 「📧 邮箱配置」Tab 切换邮箱来源（outlook / cf_temp）
+  - 支持 `dreamhunter2333/cloudflare_temp_email` 部署的 Worker
+  - CF 模式下不需要 outlook 接码号，注册时随机生成 catch-all 邮箱
+  - 内置 `/admin/new_address` + `/admin/mails` 接口对接 + Bot Fight Mode 绕过
+- 🔄 **账号重置功能**：done/failed 状态的号一键重置回 available；支持批量勾选重置
+- 🚀 **多 worker 并发**（1-20）+ 代理池 round-robin：auto-loop 改成多线程，每个 worker 独立代理
+- 🔑 **refresh_token 重拿按钮**：单行 / 批量重走 Codex OAuth（拿不到 RT 时养几天再试）
+- 🩺 **错误分类 + 熔断**：网络错误自动 release 号；连续 3 次网络错误自动暂停 + 红色横幅
+- 📦 **批量操作**：ZIP 导出注册结果 + 批量删除号池/凭证 + 按状态批量删
+- ✅ **session_token 三路兜底**：cookie / JSON / domain-free，新号也能拿到
 
 ## 🎀 两种使用方式
 
@@ -40,6 +55,7 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 | `register_outlook.py` | ~100 | **命令行入口**：4 段格式 → `AuthFlow.run_register` → 写出账号 JSON |
 | `auth_flow.py` | ~2790 | **纯协议核心**：csrf → authorize → sentinel → signup → otp → create_account → callback → token exchange |
 | `mail_outlook.py` | ~300 | Outlook IMAP XOAUTH2 取 OTP（refresh_token 续期 + 多 folder + tm1 影子过滤） |
+| `mail_cf.py` | ~260 | CF Worker 自建邮箱 Provider（`cloudflare_temp_email` 兼容；OTP 抽取防误判：HTML span 优先 + 排除邮箱/时间戳/hex 颜色） |
 | `sentinel.py` | ~290 | OpenAI Sentinel Token 纯 Python PoW（FNV-1a 32-bit） |
 | `sentinel_quickjs.py` | ~270 | Sentinel Token QuickJS 路径（跑 OpenAI sdk.js，需要 node） |
 | `openai_sentinel_quickjs.js` | ~400 | QuickJS 路径用的 sdk.js wrapper |

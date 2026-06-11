@@ -153,7 +153,19 @@ def api_stats():
 @app.post("/api/register")
 def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
-    if req.email:
+    mail_source = db.get_setting("mail_source", "outlook")
+    is_cf = (mail_source == "cf_temp")
+
+    if is_cf:
+        # CF 模式：不需要 outlook 号池，用虚拟占位 account
+        import time as _t
+        account = {
+            "email": f"cf_placeholder_{int(_t.time())}@cf.local",
+            "password": "",
+            "client_id": "",
+            "refresh_token": "",
+        }
+    elif req.email:
         account = db.claim_account(req.email)
         if not account:
             raise HTTPException(400, f"邮箱 {req.email} 不可用 (不存在 / 已 in_use / 已完成)")
@@ -171,7 +183,7 @@ def api_register(req: RegisterReq):
         "allow_existing_login": req.allow_existing_login,
     }
     run_id = registrar.start_registration(account, options)
-    logger.info(f"[run] {run_id} -> {account['email']}")
+    logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
     return {"ok": True, "run_id": run_id, "email": account["email"]}
 
 
@@ -336,6 +348,57 @@ def api_bulk_refetch_rt(req: BulkRefetchRtReq):
         "skipped": skipped,
         "results": results,
     }
+
+
+# ──────────────────────── 邮箱来源配置 ────────────────────────
+
+
+@app.get("/api/settings/mail")
+def api_get_mail_config():
+    return {"ok": True, "config": db.get_mail_config()}
+
+
+class SaveMailConfigReq(BaseModel):
+    mail_source: Optional[str] = None       # outlook / cf_temp
+    cf_api_url: Optional[str] = None
+    cf_admin_token: Optional[str] = None
+    cf_domain: Optional[str] = None
+
+
+@app.post("/api/settings/mail")
+def api_save_mail_config(req: SaveMailConfigReq):
+    db.save_mail_config(req.model_dump(exclude_none=True))
+    return {"ok": True, "config": db.get_mail_config()}
+
+
+@app.post("/api/settings/mail/test")
+def api_test_mail():
+    """测试 CF Temp Email 连通性：创建一个测试地址，确认 admin_token + domain 都对。"""
+    mail_source = db.get_setting("mail_source", "outlook")
+    if mail_source != "cf_temp":
+        raise HTTPException(400, f"当前 mail_source={mail_source}，不需要测试")
+
+    api_url = db.get_setting("cf_api_url", "")
+    domain = db.get_setting("cf_domain", "")
+    token = db.get_cf_admin_token()
+    if not api_url:
+        raise HTTPException(400, "未配置 cf_api_url")
+    if not domain:
+        raise HTTPException(400, "未配置 cf_domain")
+    if not token:
+        raise HTTPException(400, "未配置 cf_admin_token")
+
+    import sys as _sys
+    ROOT_DIR = Path(__file__).resolve().parents[1]
+    if str(ROOT_DIR) not in _sys.path:
+        _sys.path.insert(0, str(ROOT_DIR))
+    from mail_cf import CFTempEmailProvider
+    try:
+        provider = CFTempEmailProvider(api_url=api_url, admin_token=token, domain=domain)
+        test_email = provider.create_mailbox()
+        return {"ok": True, "message": f"连接成功，测试邮箱: {test_email}"}
+    except Exception as e:
+        raise HTTPException(500, f"连接失败: {e}")
 
 
 # ──────────────────────── auto-loop ────────────────────────
