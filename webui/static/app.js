@@ -692,6 +692,19 @@ $("#poolTable").addEventListener("click", async (e) => {
 
 // ──────────────────────── 注册结果列表 ────────────────────────
 
+function _registeredPaymentLinkHtml(link) {
+  const url = String(link || "").trim();
+  if (!url) return "—";
+  const label = url.length > 42 ? `${url.slice(0, 24)}...${url.slice(-12)}` : url;
+  return `
+    <div class="payment-link-cell">
+      <span class="payment-link-url" title="${escapeHtml(url)}">${escapeHtml(label)}</span>
+      <button data-session-link-copy="${escapeHtml(url)}" type="button">复制</button>
+      <button data-session-link-open="${escapeHtml(url)}" type="button">打开</button>
+    </div>
+  `;
+}
+
 async function refreshRegistered() {
   const { items } = await api("/api/registered");
   const filter = document.querySelector("input[name='regFilter']:checked")?.value || "all";
@@ -707,17 +720,22 @@ async function refreshRegistered() {
   const tb = $("#regTable tbody");
   tb.innerHTML = "";
   for (const r of filtered) {
+    const email = escapeHtml(r.email);
+    const atLen = Number(r.at_len || 0);
+    const stLen = Number(r.st_len || 0);
+    const rtLen = Number(r.rt_len || 0);
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><input type="checkbox" class="reg-check" data-email="${r.email}"></td>
-      <td>${r.email}</td>
-      <td>${r.at_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="access_token" title="点击复制 access_token">✅ ${r.at_len} 📋</button>` : "—"}</td>
-      <td>${r.st_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="session_token" title="点击复制 session_token">✅ ${r.st_len} 📋</button>` : "—"}</td>
-      <td>${r.rt_len > 0 ? `<button class="copy-cell" data-email="${r.email}" data-field="refresh_token" title="点击复制 refresh_token">✅ ${r.rt_len} 📋</button>` : "—"}</td>
+      <td><input type="checkbox" class="reg-check" data-email="${email}"></td>
+      <td>${email}</td>
+      <td>${atLen > 0 ? `<button class="copy-cell" data-email="${email}" data-field="access_token" title="点击复制 access_token">✅ ${escapeHtml(atLen)} 📋</button>` : "—"}</td>
+      <td>${stLen > 0 ? `<button class="copy-cell" data-email="${email}" data-field="session_token" title="点击复制 session_token">✅ ${escapeHtml(stLen)} 📋</button>` : "—"}</td>
+      <td>${rtLen > 0 ? `<button class="copy-cell" data-email="${email}" data-field="refresh_token" title="点击复制 refresh_token">✅ ${escapeHtml(rtLen)} 📋</button>` : "—"}</td>
+      <td>${_registeredPaymentLinkHtml(r.payment_link)}</td>
       <td>${fmtTime(r.created_at)}</td>
       <td>
-        <button data-act="view" data-email="${r.email}">查看凭证</button>
-        <button data-act="del" data-email="${r.email}">删除</button>
+        <button data-act="view" data-email="${email}">查看凭证</button>
+        <button data-act="del" data-email="${email}">删除</button>
       </td>
     `;
     tb.appendChild(tr);
@@ -741,6 +759,7 @@ function _updateSelCountReg() {
   const n = _selectedRegEmails().length;
   $("#selCountReg").textContent = n;
   $("#btnDeleteSelectedReg").disabled = n === 0;
+  $("#btnImportToSessionLink").disabled = n === 0;
 }
 $("#regTable").addEventListener("change", (e) => {
   if (e.target.classList.contains("reg-check")) _updateSelCountReg();
@@ -789,6 +808,30 @@ $("#btnDeleteAllReg").addEventListener("click", async () => {
   }
 });
 
+$("#btnImportToSessionLink").addEventListener("click", async () => {
+  const emails = _selectedRegEmails();
+  if (!emails.length) return;
+  $("#btnImportToSessionLink").disabled = true;
+  $("#exportResult").textContent = "导入链接生成中...";
+  $("#exportResult").className = "result";
+  try {
+    const r = await api("/api/session-link/accounts/import-registered", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    const missing = Number(r.missing_token || 0);
+    const suffix = missing ? `，缺少 token ${missing} 条` : "";
+    $("#exportResult").textContent = `已导入 ${r.imported || 0} 条，更新 ${r.updated || 0} 条${suffix}`;
+    $("#exportResult").className = "result ok";
+    refreshRegistered();
+  } catch (e) {
+    $("#exportResult").textContent = "导入失败: " + e.message;
+    $("#exportResult").className = "result bad";
+  } finally {
+    _updateSelCountReg();
+  }
+});
+
 // 缓存最近查看的凭证（用于"复制全部 JSON"按钮和单字段复制）
 let _credCache = null;
 
@@ -817,6 +860,14 @@ async function _copyText(text, btn) {
 $("#regTable").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
   if (!btn) return;
+  if (btn.dataset.sessionLinkCopy) {
+    await _copyText(btn.dataset.sessionLinkCopy, btn);
+    return;
+  }
+  if (btn.dataset.sessionLinkOpen) {
+    window.open(btn.dataset.sessionLinkOpen, "_blank", "noopener");
+    return;
+  }
   const email = btn.dataset.email;
   if (!email) return;
 

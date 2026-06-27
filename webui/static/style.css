@@ -1580,6 +1580,23 @@ td {
   padding: 2px 7px;
 }
 
+.payment-link-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 190px;
+}
+
+.payment-link-url {
+  max-width: 220px;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 tbody tr:hover {
   background: var(--surface-hover);
 }

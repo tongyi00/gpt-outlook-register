@@ -257,6 +257,48 @@ class CustomSmsStaticUiTests(unittest.TestCase):
         self.assertIn('id="runTable"', records_html)
         self.assertNotIn('id="regTable"', records_html)
 
+    def test_chatgpt_registered_table_imports_selected_accounts_to_session_link(self):
+        html = (ROOT / "webui" / "static" / "index.html").read_text(encoding="utf-8")
+        js = (ROOT / "webui" / "static" / "app.js").read_text(encoding="utf-8")
+        css = (ROOT / "webui" / "static" / "style.css").read_text(encoding="utf-8")
+
+        register_start = html.index('id="tab-register"')
+        register_end = html.index('id="tab-pool"', register_start)
+        register_html = html[register_start:register_end]
+
+        self.assertIn('id="btnImportToSessionLink"', register_html)
+        self.assertLess(register_html.index('id="btnImportToSessionLink"'), register_html.index('id="btnDeleteSelectedReg"'))
+        self.assertIn("<th>支付链接</th>", register_html)
+        self.assertLess(register_html.index("<th>refresh_token</th>"), register_html.index("<th>支付链接</th>"))
+        self.assertLess(register_html.index("<th>支付链接</th>"), register_html.index("<th>时间</th>"))
+
+        refresh_start = js.index("async function refreshRegistered()")
+        refresh_end = js.index('$("#btnRefreshReg")', refresh_start)
+        refresh_js = js[refresh_start:refresh_end]
+        self.assertIn("r.payment_link", refresh_js)
+        self.assertIn("_registeredPaymentLinkHtml(r.payment_link)", refresh_js)
+        self.assertIn("const email = escapeHtml(r.email)", refresh_js)
+        self.assertNotIn('data-email="${r.email}"', refresh_js)
+        self.assertNotIn("<td>${r.email}</td>", refresh_js)
+        self.assertIn('data-email="${email}"', refresh_js)
+        self.assertIn("<td>${email}</td>", refresh_js)
+        self.assertIn("payment-link-cell", js)
+        self.assertIn("data-session-link-open", js)
+        self.assertIn("data-session-link-copy", js)
+
+        import_start = js.index('$("#btnImportToSessionLink")')
+        export_start = js.index("async function _manualExportSelected", import_start)
+        import_js = js[import_start:export_start]
+        self.assertIn('/api/session-link/accounts/import-registered', import_js)
+        self.assertIn("JSON.stringify({ emails })", import_js)
+        self.assertIn("_selectedRegEmails()", import_js)
+        self.assertIn('$("#btnImportToSessionLink").disabled = true', import_js)
+        self.assertIn("_updateSelCountReg()", import_js)
+        self.assertNotIn('activateTab("sessionlink")', import_js)
+        self.assertNotIn("activateTab('sessionlink')", import_js)
+
+        self.assertIn(".payment-link-cell", css)
+
     def test_run_records_header_is_trimmed_and_table_scrolls_inside_card(self):
         html = (ROOT / "webui" / "static" / "index.html").read_text(encoding="utf-8")
         js = (ROOT / "webui" / "static" / "app.js").read_text(encoding="utf-8")
