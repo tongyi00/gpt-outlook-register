@@ -18,6 +18,22 @@ DB_PATH = Path(__file__).resolve().parent / "webui.db"
 _lock = threading.Lock()  # SQLite 写入串行化
 
 
+def _normalize_email(email: str) -> str:
+    return str(email or "").strip().lower()
+
+
+def _normalize_email_list(emails: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for email in emails or []:
+        clean = _normalize_email(email)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
 def _conn() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
@@ -59,6 +75,7 @@ def init_db():
             csrf_token      TEXT,
             cookie_header   TEXT,
             extra_json      TEXT,
+            payment_link    TEXT,
             created_at      REAL
         );
 
@@ -86,6 +103,37 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_custom_sms_status ON custom_sms_accounts(status);
+
+        CREATE TABLE IF NOT EXISTS session_link_accounts (
+            email             TEXT PRIMARY KEY,
+            status            TEXT NOT NULL DEFAULT 'pending',
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            collision_count   INTEGER NOT NULL DEFAULT 0,
+            long_url          TEXT,
+            error             TEXT,
+            payment_mode      TEXT,
+            target_amount     TEXT,
+            proxy_url         TEXT,
+            created_at        REAL,
+            updated_at        REAL,
+            started_at        REAL,
+            finished_at       REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_link_accounts_status
+            ON session_link_accounts(status);
+
+        CREATE TABLE IF NOT EXISTS session_link_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            email       TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            stage       TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            created_at  REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_link_logs_email_time
+            ON session_link_logs(email, created_at);
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -102,6 +150,12 @@ def init_db():
         con.commit()
     if cols and "success_count" not in cols:
         con.execute("ALTER TABLE custom_sms_accounts ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0")
+        con.commit()
+
+    cur = con.execute("PRAGMA table_info(registered)")
+    cols = {r[1] for r in cur.fetchall()}
+    if cols and "payment_link" not in cols:
+        con.execute("ALTER TABLE registered ADD COLUMN payment_link TEXT")
         con.commit()
     con.close()
 
@@ -589,20 +643,25 @@ def save_registered(d: dict) -> None:
     凭证三件套（access_token / session_token / refresh_token）单独存列；
     其余字段（如 device_id / cookie_header / id_token / 自定义元数据）打包进 extra_json。
     """
-    email = (d.get("email") or "").lower()
+    email = _normalize_email(d.get("email"))
     if not email:
         return
     extra = {k: v for k, v in d.items() if k not in {
         "email", "password", "access_token", "session_token", "refresh_token",
-        "id_token", "device_id", "csrf_token", "cookie_header",
+        "id_token", "device_id", "csrf_token", "cookie_header", "payment_link",
     }}
     with _lock:
         con = _conn()
+        payment_link = d.get("payment_link")
+        if payment_link is None:
+            cur = con.execute("SELECT payment_link FROM registered WHERE email=?", (email,))
+            existing = cur.fetchone()
+            payment_link = existing["payment_link"] if existing else ""
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
-            "id_token, device_id, csrf_token, cookie_header, extra_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "id_token, device_id, csrf_token, cookie_header, extra_json, payment_link, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 email,
                 d.get("password", ""),
@@ -614,6 +673,7 @@ def save_registered(d: dict) -> None:
                 d.get("csrf_token", ""),
                 d.get("cookie_header", ""),
                 json.dumps(extra, ensure_ascii=False) if extra else None,
+                payment_link,
                 time.time(),
             ),
         )
@@ -625,7 +685,7 @@ def list_registered(limit: int = 500) -> list[dict]:
     cur = con.execute(
         "SELECT email, password, "
         "length(access_token) AS at_len, length(session_token) AS st_len, "
-        "length(refresh_token) AS rt_len, created_at FROM registered "
+        "length(refresh_token) AS rt_len, payment_link, created_at FROM registered "
         "ORDER BY created_at DESC LIMIT ?",
         (limit,),
     )
@@ -654,7 +714,7 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
 
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
+    cur = con.execute("SELECT * FROM registered WHERE email=?", (_normalize_email(email),))
     row = cur.fetchone()
     if not row:
         return None
@@ -671,7 +731,7 @@ def get_registered(email: str) -> Optional[dict]:
 def delete_registered(email: str) -> bool:
     with _lock:
         con = _conn()
-        rc = con.execute("DELETE FROM registered WHERE email=?", (email.lower(),))
+        rc = con.execute("DELETE FROM registered WHERE email=?", (_normalize_email(email),))
         con.commit()
         return rc.rowcount > 0
 
@@ -697,6 +757,226 @@ def delete_all_registered() -> int:
         rc = con.execute("DELETE FROM registered")
         con.commit()
         return rc.rowcount
+
+
+# ──────────────────────── Session Link 账号任务 ────────────────────────
+
+
+_SESSION_LINK_ACCOUNT_FIELDS = {
+    "status",
+    "attempts",
+    "collision_count",
+    "long_url",
+    "error",
+    "payment_mode",
+    "target_amount",
+    "proxy_url",
+    "started_at",
+    "finished_at",
+}
+
+
+def import_session_link_accounts(emails: list[str]) -> dict:
+    cleaned = _normalize_email_list(emails)
+    now = time.time()
+    imported = updated = missing_token = 0
+    with _lock:
+        con = _conn()
+        for email in cleaned:
+            cur = con.execute(
+                "SELECT access_token FROM registered WHERE email=?",
+                (email,),
+            )
+            registered = cur.fetchone()
+            has_token = bool((registered["access_token"] if registered else "").strip())
+            status = "pending" if has_token else "missing_token"
+            if not has_token:
+                missing_token += 1
+
+            cur = con.execute(
+                "SELECT status FROM session_link_accounts WHERE email=?",
+                (email,),
+            )
+            existing = cur.fetchone()
+            if existing is None:
+                con.execute(
+                    "INSERT INTO session_link_accounts "
+                    "(email, status, attempts, collision_count, created_at, updated_at) "
+                    "VALUES (?, ?, 0, 0, ?, ?)",
+                    (email, status, now, now),
+                )
+                imported += 1
+                continue
+
+            new_status = existing["status"]
+            if not has_token:
+                new_status = "missing_token"
+            elif existing["status"] == "missing_token":
+                new_status = "pending"
+            con.execute(
+                "UPDATE session_link_accounts SET status=?, updated_at=? WHERE email=?",
+                (new_status, now, email),
+            )
+            updated += 1
+        con.commit()
+    return {
+        "parsed": len(cleaned),
+        "imported": imported,
+        "updated": updated,
+        "missing_token": missing_token,
+    }
+
+
+def list_session_link_accounts(status: str = "", limit: int = 500) -> list[dict]:
+    s = str(status or "").strip().lower()
+    try:
+        n = int(limit)
+    except Exception:
+        n = 500
+    n = max(1, min(n, 5000))
+
+    con = _conn()
+    if s:
+        cur = con.execute(
+            "SELECT * FROM session_link_accounts WHERE status=? "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+            (s, n),
+        )
+    else:
+        cur = con.execute(
+            "SELECT * FROM session_link_accounts "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+            (n,),
+        )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def get_session_link_account(email: str) -> Optional[dict]:
+    clean = _normalize_email(email)
+    if not clean:
+        return None
+    con = _conn()
+    cur = con.execute("SELECT * FROM session_link_accounts WHERE email=?", (clean,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def update_session_link_account(email: str, **fields) -> bool:
+    clean = _normalize_email(email)
+    if not clean:
+        return False
+    updates = []
+    values = []
+    for key, value in fields.items():
+        if key not in _SESSION_LINK_ACCOUNT_FIELDS:
+            continue
+        updates.append(f"{key}=?")
+        values.append(value)
+    if not updates:
+        return False
+    updates.append("updated_at=?")
+    values.append(time.time())
+    values.append(clean)
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"UPDATE session_link_accounts SET {', '.join(updates)} WHERE email=?",
+            values,
+        )
+        con.commit()
+        return rc.rowcount > 0
+
+
+def append_session_link_log(email: str, kind: str, stage: str, message: str) -> None:
+    clean = _normalize_email(email)
+    if not clean:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "INSERT INTO session_link_logs(email, kind, stage, message, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                clean,
+                str(kind or ""),
+                str(stage or ""),
+                str(message or ""),
+                time.time(),
+            ),
+        )
+        con.commit()
+
+
+def list_session_link_logs(email: str, limit: int = 300) -> list[dict]:
+    clean = _normalize_email(email)
+    if not clean:
+        return []
+    try:
+        n = int(limit)
+    except Exception:
+        n = 300
+    n = max(1, min(n, 5000))
+    con = _conn()
+    cur = con.execute(
+        "SELECT * FROM ("
+        "SELECT * FROM session_link_logs WHERE email=? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?"
+        ") ORDER BY created_at ASC, id ASC",
+        (clean, n),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def reset_session_link_accounts(emails: list[str]) -> int:
+    cleaned = _normalize_email_list(emails)
+    if not cleaned:
+        return 0
+    placeholders = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE session_link_accounts SET status='pending', attempts=0, "
+            "collision_count=0, long_url=NULL, error=NULL, proxy_url=NULL, "
+            "started_at=NULL, finished_at=NULL, updated_at=? "
+            f"WHERE email IN ({placeholders})",
+            [time.time(), *cleaned],
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def delete_session_link_accounts(emails: list[str]) -> int:
+    cleaned = _normalize_email_list(emails)
+    if not cleaned:
+        return 0
+    placeholders = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"DELETE FROM session_link_accounts WHERE email IN ({placeholders})",
+            cleaned,
+        )
+        deleted = rc.rowcount
+        con.execute(
+            f"DELETE FROM session_link_logs WHERE email IN ({placeholders})",
+            cleaned,
+        )
+        con.commit()
+        return deleted
+
+
+def set_registered_payment_link(email: str, link: str) -> bool:
+    clean = _normalize_email(email)
+    if not clean:
+        return False
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE registered SET payment_link=? WHERE email=?",
+            (str(link or ""), clean),
+        )
+        con.commit()
+        return rc.rowcount > 0
 
 
 # ──────────────────────── 运行记录 ────────────────────────
