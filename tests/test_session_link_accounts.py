@@ -61,10 +61,23 @@ class SessionLinkAccountsDbTests(unittest.TestCase):
 
         self.with_db(run)
 
+    def test_import_marks_null_access_token_as_missing_token(self):
+        def run():
+            db.save_registered({"email": "null-token@example.com", "access_token": None})
+
+            result = db.import_session_link_accounts(["null-token@example.com"])
+            row = db.get_session_link_account("null-token@example.com")
+
+            self.assertEqual(result["missing_token"], 1)
+            self.assertEqual(row["status"], "missing_token")
+
+        self.with_db(run)
+
     def test_missing_token_import_returns_to_pending_after_token_exists(self):
         def run():
             db.save_registered({"email": "a@example.com", "access_token": ""})
             db.import_session_link_accounts(["a@example.com"])
+            db.update_session_link_account("a@example.com", error="missing access token")
             db.save_registered({"email": "a@example.com", "access_token": "token-a"})
 
             result = db.import_session_link_accounts(["a@example.com"])
@@ -72,6 +85,7 @@ class SessionLinkAccountsDbTests(unittest.TestCase):
 
             self.assertEqual(result["updated"], 1)
             self.assertEqual(row["status"], "pending")
+            self.assertIsNone(row["error"])
 
         self.with_db(run)
 
@@ -102,6 +116,48 @@ class SessionLinkAccountsDbTests(unittest.TestCase):
             self.assertEqual(row["payment_link"], "https://pay.example/link")
 
         self.with_db(run)
+
+    def test_init_db_migrates_old_registered_table_payment_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            test_db = Path(td) / "webui.db"
+            con = sqlite3.connect(
+                str(test_db),
+                check_same_thread=False,
+                timeout=30,
+                factory=KeepOpenConnection,
+            )
+            con.row_factory = sqlite3.Row
+            try:
+                con.execute(
+                    "CREATE TABLE registered ("
+                    "email TEXT PRIMARY KEY, "
+                    "password TEXT, "
+                    "access_token TEXT, "
+                    "session_token TEXT, "
+                    "refresh_token TEXT, "
+                    "id_token TEXT, "
+                    "device_id TEXT, "
+                    "csrf_token TEXT, "
+                    "cookie_header TEXT, "
+                    "extra_json TEXT, "
+                    "created_at REAL"
+                    ")"
+                )
+                con.execute(
+                    "INSERT INTO registered(email, password, access_token, created_at) "
+                    "VALUES ('old@example.com', 'pw', 'token-old', 1)"
+                )
+                con.commit()
+                with patch.object(db, "_conn", return_value=con):
+                    db.init_db()
+                    cols = {row["name"] for row in con.execute("PRAGMA table_info(registered)").fetchall()}
+
+                    self.assertIn("payment_link", cols)
+                    self.assertTrue(db.set_registered_payment_link("old@example.com", "https://pay.example/old"))
+                    row = db.list_registered()[0]
+                    self.assertEqual(row["payment_link"], "https://pay.example/old")
+            finally:
+                con.real_close()
 
     def test_session_link_logs_append_and_list(self):
         def run():

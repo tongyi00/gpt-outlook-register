@@ -788,7 +788,7 @@ def import_session_link_accounts(emails: list[str]) -> dict:
                 (email,),
             )
             registered = cur.fetchone()
-            has_token = bool((registered["access_token"] if registered else "").strip())
+            has_token = bool(((registered["access_token"] if registered else "") or "").strip())
             status = "pending" if has_token else "missing_token"
             if not has_token:
                 missing_token += 1
@@ -809,14 +809,22 @@ def import_session_link_accounts(emails: list[str]) -> dict:
                 continue
 
             new_status = existing["status"]
+            clear_error = False
             if not has_token:
                 new_status = "missing_token"
             elif existing["status"] == "missing_token":
                 new_status = "pending"
-            con.execute(
-                "UPDATE session_link_accounts SET status=?, updated_at=? WHERE email=?",
-                (new_status, now, email),
-            )
+                clear_error = True
+            if clear_error:
+                con.execute(
+                    "UPDATE session_link_accounts SET status=?, error=NULL, updated_at=? WHERE email=?",
+                    (new_status, now, email),
+                )
+            else:
+                con.execute(
+                    "UPDATE session_link_accounts SET status=?, updated_at=? WHERE email=?",
+                    (new_status, now, email),
+                )
             updated += 1
         con.commit()
     return {
