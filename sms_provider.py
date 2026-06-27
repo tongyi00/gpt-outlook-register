@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -82,6 +83,34 @@ class BaseSmsProvider(ABC):
     def set_resend_callback(self, callback: Optional[Callable[[], None]]) -> None:
         """注册 resend 钩子（SmsBower 长等待时回调业务侧重新触发 OTP）。"""
         return None
+
+
+class CustomSmsProvider(BaseSmsProvider):
+    """基于手机号 -> API URL 的自定义接码 provider。"""
+
+    auto_report_success_on_code = True
+
+    def __init__(self, *, regex: str):
+        pattern = str(regex or "").strip() or r"(?<!\d)\d{6}(?!\d)"
+        self.regex = pattern
+        self._compiled = re.compile(pattern)
+
+    def get_number(self, *, service: str, country: str = "",
+                    country_candidates: Optional[list[str]] = None) -> SmsActivation:
+        raise RuntimeError("CustomSmsProvider 不支持直接租号")
+
+    def get_code(self, activation_id: str, *, timeout: int = 180) -> str:
+        raise RuntimeError("CustomSmsProvider 不支持轮询取码")
+
+    def cancel(self, activation_id: str) -> bool:
+        return True
+
+    def get_balance(self) -> float:
+        return 0.0
+
+    def extract_code(self, text: str) -> str:
+        m = self._compiled.search(str(text or ""))
+        return m.group(0) if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +844,8 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
                 sms_reuse_phone / sms_phone_success_max
     """
     pk = (provider_key or "").lower().strip()
+    if pk in ("custom", "custom_sms", "customsms"):
+        return CustomSmsProvider(regex=str(config.get("sms_custom_regex") or r"(?<!\d)\d{6}(?!\d)"))
     api_key = str(config.get("sms_api_key") or "").strip()
     if not api_key:
         raise RuntimeError(f"{pk} 未配置 API Key")
@@ -868,18 +899,42 @@ class PhoneCallbackController:
         self.country = country
         self.log = log_fn or logger.info
         self.auto_select_country = bool(auto_select_country)
+        self._is_custom = self.provider_key in ("custom", "custom_sms", "customsms")
         self.provider: Optional[BaseSmsProvider] = None
         self.activation: Optional[SmsActivation] = None
         self.completed = False
         self._verify_lock_acquired = False
+        self._custom_regex = re.compile(
+            str(self.config.get("sms_custom_regex") or r"(?<!\d)\d{6}(?!\d)").strip()
+        )
 
     def _provider(self) -> BaseSmsProvider:
+        if self._is_custom:
+            raise RuntimeError("custom sms provider does not use BaseSmsProvider")
         if self.provider is None:
             self.provider = create_sms_provider(self.provider_key, self.config)
         return self.provider
 
+    def _db(self):
+        import importlib
+        return importlib.import_module("webui.db")
+
     def get_phone(self) -> str:
         """阶段 1：租手机号（已带 +）。"""
+        if self._is_custom:
+            db = self._db()
+            row = db.claim_custom_sms_phone()
+            if not row:
+                raise RuntimeError("自定义接码号池为空")
+            self.activation = SmsActivation(
+                activation_id=row["phone"],
+                phone_number=row["phone"],
+                country="",
+                metadata={"api_url": row.get("api_url") or ""},
+            )
+            self.log(f"📱 已 claim 自定义接码: phone={row['phone']}")
+            return row["phone"]
+
         provider = self._provider()
         # 同号复用锁（SmsBower 系列才用，防止两个注册任务并发抢同一个 cache）
         if isinstance(provider, SmsBowerProvider) and not self._verify_lock_acquired:
@@ -962,6 +1017,32 @@ class PhoneCallbackController:
         """阶段 2：等待 SMS 验证码。"""
         if not self.activation:
             raise RuntimeError("PhoneCallbackController: 未先 get_phone")
+        if self._is_custom:
+            api_url = str((self.activation.metadata or {}).get("api_url") or "").strip()
+            if not api_url:
+                raise RuntimeError("自定义接码未配置 api_url")
+            deadline = time.time() + max(5, int(timeout or 180))
+            last_err = None
+            while time.time() < deadline:
+                try:
+                    resp = requests.get(
+                        api_url,
+                        timeout=min(15, max(3, int(timeout or 180))),
+                        proxies=self._proxies if hasattr(self, "_proxies") else None,
+                    )
+                    text = resp.text or ""
+                    m = self._custom_regex.search(text)
+                    if m:
+                        code = m.group(0)
+                        self.log(f"✅ 自定义接码命中验证码: {code}")
+                        return code
+                    last_err = RuntimeError("未从自定义接码响应中提取到验证码")
+                except Exception as e:
+                    last_err = e
+                time.sleep(3)
+            if last_err:
+                raise last_err
+            return ""
         provider = self._provider()
         self.log(f"⏳ 等待 SMS 验证码... (activation_id={self.activation.activation_id} timeout={timeout}s)")
         code = provider.get_code(self.activation.activation_id, timeout=timeout)
@@ -974,6 +1055,15 @@ class PhoneCallbackController:
         return code
 
     def report_success(self) -> None:
+        if self.activation and not self.completed:
+            if self._is_custom:
+                try:
+                    self._db().mark_custom_sms_done(self.activation.phone_number)
+                except Exception as e:
+                    logger.warning("custom report_success 失败: %s", e)
+                self.completed = True
+                self.log(f"🎉 已标记自定义号码成功完成: phone={self.activation.phone_number}")
+                return
         if self.activation and self.provider and not self.completed:
             try:
                 self.provider.report_success(self.activation.activation_id)
@@ -984,13 +1074,20 @@ class PhoneCallbackController:
         self._release_lock()
 
     def mark_code_failed(self, reason: str = "") -> None:
-        if self.activation and self.provider:
+        if self.activation and self._is_custom:
+            try:
+                self._db().mark_custom_sms_failed(self.activation.phone_number, reason=reason)
+            except Exception:
+                pass
+        elif self.activation and self.provider:
             try:
                 self.provider.mark_code_failed(self.activation.activation_id, reason=reason)
             except Exception:
                 pass
 
     def mark_send_succeeded(self) -> None:
+        if self.activation and self._is_custom:
+            return
         if self.activation and self.provider:
             try:
                 self.provider.mark_send_succeeded(self.activation.activation_id)
@@ -998,6 +1095,12 @@ class PhoneCallbackController:
                 pass
 
     def mark_send_failed(self, reason: str = "") -> None:
+        if self.activation and self._is_custom:
+            try:
+                self._db().mark_custom_sms_failed(self.activation.phone_number, reason=reason)
+            except Exception:
+                pass
+            return
         if self.activation and self.provider:
             try:
                 self.provider.mark_send_failed(self.activation.activation_id, reason=reason)
@@ -1005,6 +1108,8 @@ class PhoneCallbackController:
                 pass
 
     def set_resend_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        if self._is_custom:
+            return
         try:
             self._provider().set_resend_callback(callback)
         except Exception:
@@ -1012,6 +1117,13 @@ class PhoneCallbackController:
 
     def cleanup(self) -> None:
         """流程结束（成功或失败）调用：释放未完成的号、解锁。"""
+        if self.activation and not self.completed and self._is_custom:
+            try:
+                self._db().release_custom_sms_unused(self.activation.phone_number)
+                self.log(f"🗑️ 已释放未使用自定义号码: phone={self.activation.phone_number}")
+            except Exception:
+                pass
+            return
         if self.activation and not self.completed and self.provider:
             try:
                 self.provider.cancel(self.activation.activation_id)

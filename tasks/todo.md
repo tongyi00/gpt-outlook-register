@@ -1,0 +1,17 @@
+- [x] Restate goal + acceptance criteria
+  - 目标：实现账号级链接生成工作台，支持从 ChatGPT 注册结果导入、选中账号异步执行、阶段状态机、撞链次数、停止次数、每账号日志和支付链接回写。
+  - 验收：email 唯一；代理池随机探测直到找到可用代理；代理失败不计撞链；停止次数按撞链次数生效；ChatGPT 表显示支付链接；链接生成页无线程数、顶部操作齐全；测试和浏览器验证通过。
+- [x] Locate existing implementation / patterns
+  - 设计文档：`docs/plans/2026-06-27-session-link-account-workbench-design.md`。
+  - 现有链接核心：`session_link_gen/core.py`。
+  - 现有链接控制器：`webui/session_link.py`。
+  - 注册结果存储与表格：`webui/db.py`、`webui/static/index.html`、`webui/static/app.js`。
+- [x] Design: minimal approach + key decisions
+  - 独立 `session_link_accounts` / `session_link_logs`，`registered.payment_link` 做回显。
+  - 后端固定线程池默认 `max_workers=10`。
+  - 实施计划已写入 `docs/plans/2026-06-27-session-link-account-workbench-implementation.md`。
+- [ ] Implement smallest safe slice
+- [ ] Add/adjust tests
+- [ ] Run verification (lint/tests/build/manual repro)
+- [ ] Summarize changes + verification story
+- [ ] Record lessons (if any)

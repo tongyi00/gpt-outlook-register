@@ -28,6 +28,7 @@ from . import db  # noqa: E402
 
 # run_id -> queue of log strings; sentinel = None 表示流结束
 _run_queues: dict[str, queue.Queue] = {}
+_run_cancel_events: dict[str, threading.Event] = {}
 _lock = threading.Lock()
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -82,7 +83,7 @@ _NETWORK_ERROR_PATTERNS = [
     "proxy", "socks", "dns", "name resolution", "name or service",
     "cloudflare", "just a moment", "403 forbidden",
     "csrf token 获取失败", "csrf token 失败",
-    "/sentinel/req", "sentinel /req", "sentinel quickjs",
+    "/sentinel/req", "sentinel /req", "sentinel quickjs", "sentinel challenge",
     "check_proxy 失败", "网络预检查",
     "curl: (35)", "curl: (28)", "curl: (6)", "curl: (7)",
     "remote disconnected", "connection reset", "connection aborted",
@@ -93,11 +94,14 @@ _NETWORK_ERROR_PATTERNS = [
 def classify_error(err: str) -> str:
     """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。"""
     s = (err or "").lower()
+    if "registration_cancelled" in s or "用户停止" in s:
+        return "cancelled"
     # 先匹配 account 特征（更具体），避免子串误命中（如 "outlook OTP timeout" 含 "timeout"）
     if any(p in s for p in (
         "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
-        "outlook otp timeout", "registration_disallowed",
-        "已有账号", "账号被", "refresh_token 失效",
+        "outlook otp timeout", "cftempemail otp timeout", "registration_disallowed",
+        "已有账号", "账号被", "refresh_token 失效", "outlook oauth",
+        "token 刷新失败",
     )):
         return "account"
     if any(p in s for p in _NETWORK_ERROR_PATTERNS):
@@ -110,6 +114,7 @@ def _do_register(
     account: dict,
     options: dict,
     log_file: Path,
+    cancel_event: threading.Event,
 ):
     """实际注册任务。
 
@@ -135,6 +140,7 @@ def _do_register(
     mail_source = db.get_setting("mail_source", "outlook")
 
     try:
+        _raise_if_cancelled(cancel_event)
         # 注入环境变量（不污染全局，跑完恢复）
         env_overrides = {}
         # outlook 接码邮箱常被 OpenAI 走 passwordless_signup 流程（新号收码而非设密码），
@@ -154,6 +160,11 @@ def _do_register(
 
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
+        logging.getLogger("registrar").info(
+            "[register] proxy_source=%s proxy=%s",
+            options.get("proxy_source", "unknown"),
+            "set" if cfg.proxy else "none",
+        )
 
         # ─ 邮箱来源路由：outlook 池 vs CF Worker catch-all ─
         if mail_source == "cf_temp":
@@ -165,16 +176,21 @@ def _do_register(
             api_url = db.get_setting("cf_api_url", "")
             domain  = db.get_setting("cf_domain", "")
             token   = db.get_cf_admin_token()
+            enable_prefix = db.get_setting("cf_enable_prefix", "1") != "0"
             if not api_url or not domain or not token:
                 raise RuntimeError(
                     "CF Temp Email 未配置完整（缺 api_url / domain / admin_token），"
                     "请去「邮箱配置」Tab 填写"
                 )
             mail = CFTempEmailProvider(
-                api_url=api_url, admin_token=token, domain=domain,
+                api_url=api_url,
+                admin_token=token,
+                domain=domain,
+                enable_prefix=enable_prefix,
             )
+            mail.cancel_event = cancel_event
             logging.getLogger("registrar").info(
-                f"[register] 邮箱来源: cf_temp / domain={domain}"
+                f"[register] 邮箱来源: cf_temp / domain={domain} / enable_prefix={int(enable_prefix)}"
             )
         else:
             mail = OutlookMailProvider(
@@ -183,8 +199,9 @@ def _do_register(
                 client_id=account["client_id"],
                 refresh_token=account["refresh_token"],
             )
+            mail.cancel_event = cancel_event
 
-        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id))
+        flow = AuthFlow(cfg, sms_callback=_build_sms_callback(run_id), cancel_event=cancel_event)
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         logging.getLogger("registrar").info(f"[register] 开始: {email}")
 
@@ -192,6 +209,7 @@ def _do_register(
         d: dict
         try:
             result = flow.run_register(mail)
+            _raise_if_cancelled(cancel_event)
             d = result.to_dict()
         except RuntimeError as e:
             # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
@@ -263,19 +281,26 @@ def _do_register(
     except Exception as e:
         err = str(e)
         category = classify_error(err)
-        logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
-        logging.getLogger("registrar").error(traceback.format_exc())
+        if category == "cancelled":
+            logging.getLogger("registrar").warning(f"[register] 已停止: {email}")
+        else:
+            logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
+            logging.getLogger("registrar").error(traceback.format_exc())
         # CF 模式下不操作号池
         if mail_source != "cf_temp":
-            if category == "network":
+            if category in ("network", "cancelled"):
                 db.release_unused(email)
                 logging.getLogger("registrar").warning(
-                    f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
+                    f"[register] {email} 判定为 {category}，号已 release 回 available"
                 )
             else:
                 db.mark_failed(email, f"[{category}] {err}")
-        db.finish_run(run_id, "failed", err, category=category)
-        _emit_status(run_id, "error", {"message": err, "category": category})
+        if category == "cancelled":
+            db.finish_run(run_id, "stopped", err, category=category)
+            _emit_status(run_id, "stopped", {"message": "已停止当前注册", "category": category})
+        else:
+            db.finish_run(run_id, "failed", err, category=category)
+            _emit_status(run_id, "error", {"message": err, "category": category})
 
     finally:
         # 还原 env
@@ -293,6 +318,13 @@ def _do_register(
         q = _run_queues.get(run_id)
         if q is not None:
             q.put(None)  # sentinel: 流结束
+        with _lock:
+            _run_cancel_events.pop(run_id, None)
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("registration_cancelled: 用户停止当前注册")
 
 
 def _try_export_to_panels(run_id: str, cred: dict) -> None:
@@ -362,10 +394,13 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
     cfg = db.get_sms_internal_config()
     if not cfg.get("sms_enabled"):
         return None
-    api_key = (cfg.get("sms_api_key") or "").strip()
-    if not api_key:
-        logging.getLogger("registrar").warning("[sms] 已启用接码但未配置 sms_api_key，跳过")
-        return None
+    if cfg.get("sms_provider") == "custom":
+        pass
+    else:
+        api_key = (cfg.get("sms_api_key") or "").strip()
+        if not api_key:
+            logging.getLogger("registrar").warning("[sms] 已启用接码但未配置 sms_api_key，跳过")
+            return None
 
     smslog = logging.getLogger("registrar")
 
@@ -398,12 +433,14 @@ def start_registration(account: dict, options: dict) -> str:
     db.create_run(run_id, account["email"], str(log_file))
 
     q: queue.Queue = queue.Queue()
+    cancel_event = threading.Event()
     with _lock:
         _run_queues[run_id] = q
+        _run_cancel_events[run_id] = cancel_event
 
     th = threading.Thread(
         target=_do_register,
-        args=(run_id, account, options, log_file),
+        args=(run_id, account, options, log_file, cancel_event),
         daemon=True,
         name=f"register-{run_id}",
     )
@@ -413,6 +450,17 @@ def start_registration(account: dict, options: dict) -> str:
 
 def get_run_queue(run_id: str) -> Optional[queue.Queue]:
     return _run_queues.get(run_id)
+
+
+def stop_run(run_id: str) -> dict:
+    with _lock:
+        cancel_event = _run_cancel_events.get(run_id)
+    if cancel_event is None:
+        return {"ok": False, "message": "run_id not running"}
+    cancel_event.set()
+    _emit_status(run_id, "stopped", {"message": "停止请求已发送，正在结束当前账号"})
+    logging.getLogger("registrar").warning("[run] stop requested: %s", run_id)
+    return {"ok": True, "run_id": run_id}
 
 
 def remove_run_queue(run_id: str) -> None:

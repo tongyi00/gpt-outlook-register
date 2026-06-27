@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -34,6 +35,23 @@ IMAP_HOST = "outlook.office365.com"
 # ──────────────────────── Microsoft OAuth refresh_token → access_token ────────────────────────
 
 
+class OutlookOAuthError(RuntimeError):
+    def __init__(self, message: str, status: int = 0, non_retryable: bool = True):
+        super().__init__(message)
+        self.status = status
+        self.non_retryable = non_retryable
+
+
+def _read_http_error_body(err: urllib.error.HTTPError) -> str:
+    try:
+        raw = err.read()
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        return str(raw or "")
+    except Exception:
+        return ""
+
+
 def get_outlook_access_token(refresh_token: str, client_id: str) -> str:
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token",
@@ -42,10 +60,26 @@ def get_outlook_access_token(refresh_token: str, client_id: str) -> str:
         "scope": IMAP_SCOPE,
     }).encode()
     req = urllib.request.Request(GRAPH_TOKEN_URL, data=body)
-    resp = urllib.request.urlopen(req, timeout=15)
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+    except urllib.error.HTTPError as e:
+        err_body = _read_http_error_body(e)
+        try:
+            data = json.loads(err_body or "{}")
+            err_code = str(data.get("error", "") or "")
+            err_desc = str(data.get("error_description", "") or "")
+            detail = " ".join(x for x in (err_code, err_desc) if x).strip()
+        except Exception:
+            detail = err_body.strip()
+        detail = detail[:500] or str(e)
+        raise OutlookOAuthError(
+            f"Outlook OAuth token 刷新失败: http={e.code} {detail}",
+            status=int(e.code or 0),
+            non_retryable=400 <= int(e.code or 0) < 500,
+        ) from e
     data = json.loads(resp.read())
     if not data.get("access_token"):
-        raise RuntimeError(f"outlook refresh failed: {data}")
+        raise OutlookOAuthError(f"Outlook OAuth token 响应缺 access_token: {data}", non_retryable=True)
     return data
 
 
@@ -88,6 +122,7 @@ def fetch_otp_via_imap(
     client_id: str,
     timeout: int = 240,
     threshold_ts: float = 0,
+    cancel_event=None,
 ) -> str:
     """阻塞拉 outlook OTP（OpenAI 来的最新邮件）。返回 6 位 OTP 或抛 TimeoutError。
 
@@ -105,6 +140,8 @@ def fetch_otp_via_imap(
     found_folders: list[str] | None = None  # LIST 探测一次就缓存
 
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("registration_cancelled: 用户停止当前注册")
         try:
             if not cached_token or time.time() - cached_at > 3000:
                 data = get_outlook_access_token(cached_refresh, client_id)
@@ -221,8 +258,14 @@ def fetch_otp_via_imap(
             except Exception:
                 pass
         except Exception as e:
+            if isinstance(e, OutlookOAuthError) and e.non_retryable:
+                logger.warning(f"[outlook-imap] token 刷新失败，不再重试: {e}")
+                raise
             logger.warning(f"[outlook-imap] fetch_otp 异常 (吃掉重试): {e}")
-        time.sleep(4)
+        for _ in range(40):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("registration_cancelled: 用户停止当前注册")
+            time.sleep(0.1)
     raise TimeoutError(f"outlook OTP timeout {timeout}s for {email_addr}")
 
 
@@ -253,6 +296,7 @@ class OutlookMailProvider:
             "client_id": client_id,
         }
         self.outlook_exhausted = False
+        self.cancel_event = None
 
     def mark_outlook_dead(self, reason: str = "") -> None:
         """auth_flow 在 OpenAI 静默拒发 OTP 时调用；纯协议版无 DB，仅打日志。"""
@@ -276,10 +320,15 @@ class OutlookMailProvider:
             f"[mail] outlook IMAP OAuth2 纯协议取 OTP -> {email_addr} "
             f"(timeout={timeout}s threshold>={int(strict_threshold)})"
         )
-        return fetch_otp_via_imap(
-            self.email, self.refresh_token, self.client_id,
-            timeout=timeout, threshold_ts=strict_threshold,
-        )
+        try:
+            return fetch_otp_via_imap(
+                self.email, self.refresh_token, self.client_id,
+                timeout=timeout, threshold_ts=strict_threshold,
+                cancel_event=self.cancel_event,
+            )
+        except OutlookOAuthError as e:
+            self.mark_outlook_dead(str(e))
+            raise RuntimeError(f"Outlook OAuth 凭证不可用: {e}") from e
 
 
 if __name__ == "__main__":

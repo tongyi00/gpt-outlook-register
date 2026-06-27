@@ -1,16 +1,15 @@
-"""auto-loop 控制器：多 worker 并发，每个 worker 用独立代理。
+"""auto-loop 控制器：多 worker 并发，每个账号启动前选择可用代理。
 
 设计：
   - 主控线程 manage_loop：监听 stop/pause、根据 concurrency 启停 worker
   - 多个 worker 线程：claim_next() → 注册 → 完成 → 继续
-  - 代理池：每个 worker 按 worker index 取一个代理（round-robin），避免同 IP 多号
+  - 代理池：每个账号启动前随机探测可用代理；全不可用则不 claim 账号
   - 状态机：stopped → running → paused → running / stopped
   - 优雅暂停/停止：当前 worker 跑完才退出，不强杀
   - 复用 registrar.start_registration：每个号开一个 run，由 worker 等其结束
 """
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import threading
@@ -18,6 +17,7 @@ import time
 from typing import Optional
 
 from . import db, registrar
+from .proxy_pool import parse_proxy_pool, pick_random_usable_proxy
 
 logger = logging.getLogger("auto_loop")
 
@@ -28,22 +28,12 @@ class AutoLoopState:
     PAUSED = "paused"
 
 
-def _parse_proxy_pool(text: str) -> list[str]:
-    """把多行代理字符串拆成列表。空行 / # 开头注释跳过。"""
-    out: list[str] = []
-    for line in (text or "").splitlines():
-        s = line.strip()
-        if s and not s.startswith("#"):
-            out.append(s)
-    return out
-
-
 class AutoLoopController:
     """多 worker auto-loop 控制器。
 
     options 关键字段：
-      proxy:                单代理（兼容旧版，concurrency=1 时用）
-      proxy_pool:           多代理字符串（每行一个；多 worker 会按 worker index 轮流取）
+      proxy:                单代理（手动代理优先）
+      proxy_pool:           多代理字符串（proxy 为空时，每个账号随机取可用代理）
       concurrency:          并发 worker 数（1-20）
       cool_down_seconds:    每个 worker 跑完后冷却时间（默认 3）
       其余参数透传给 registrar.start_registration
@@ -94,7 +84,7 @@ class AutoLoopController:
             # 解析并发参数
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
-            self._proxy_pool = _parse_proxy_pool(pool_text)
+            self._proxy_pool = parse_proxy_pool(pool_text)
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -198,11 +188,14 @@ class AutoLoopController:
             self._last_message = msg
         self._broadcast("state", self._snapshot())
 
-    def _proxy_for_worker(self, worker_id: int) -> str:
-        """按 worker_id 从代理池里挑一个代理。空池时回退到 options.proxy。"""
+    def _proxy_for_worker(self, worker_id: int, tester=None) -> str:
+        """手动代理优先；否则从代理池随机挑一个可用代理。"""
+        explicit_proxy = (self._options.get("proxy", "") or "").strip()
+        if explicit_proxy:
+            return explicit_proxy
         if self._proxy_pool:
-            return self._proxy_pool[worker_id % len(self._proxy_pool)]
-        return self._options.get("proxy", "") or ""
+            return pick_random_usable_proxy(self._proxy_pool, tester=tester)
+        return ""
 
     def _record_finish(self, ok: bool, category: str):
         """worker 结束一个 run 后调，更新计数 + 熔断。"""
@@ -268,8 +261,7 @@ class AutoLoopController:
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
         idle_round = 0
-        proxy = self._proxy_for_worker(worker_id)
-        logger.info(f"[worker-{worker_id}] 启动 (proxy={proxy or '直连'})")
+        logger.info(f"[worker-{worker_id}] 启动")
 
         while True:
             # 检查停止
@@ -283,6 +275,19 @@ class AutoLoopController:
                     time.sleep(0.5)
                 if self._stop_event.is_set():
                     return
+
+            explicit_proxy = (self._options.get("proxy", "") or "").strip()
+            proxy = self._proxy_for_worker(worker_id)
+            if self._proxy_pool and not explicit_proxy and not proxy:
+                msg = f"worker-{worker_id} 代理池没有可用代理，等待重试..."
+                logger.warning(msg)
+                self._set_message(msg)
+                for _ in range(30):
+                    if self._stop_event.is_set() or self._pause_event.is_set():
+                        break
+                    time.sleep(0.1)
+                continue
+            proxy_source = "manual" if explicit_proxy else ("pool" if proxy else "none")
 
             # claim 下一个号（CF 模式用虚拟占位，无需 outlook 号池）
             mail_source = db.get_setting("mail_source", "outlook")
@@ -313,8 +318,8 @@ class AutoLoopController:
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
-            if proxy:
-                run_options["proxy"] = proxy
+            run_options["proxy"] = proxy
+            run_options["proxy_source"] = proxy_source
 
             # 启一个 run
             try:
