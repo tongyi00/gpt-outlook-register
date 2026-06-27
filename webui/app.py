@@ -128,8 +128,31 @@ class SessionLinkReq(BaseModel):
     delay_seconds: int = 2
 
 
+class SessionLinkImportRegisteredReq(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+
+
+class SessionLinkRunSelectedReq(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+    payment_mode: str = "PayPal 长链接 US/USD"
+    target_amount: str = "0"
+    proxy_pool: str = ""
+    delay_seconds: int = 2
+    stop_after: int = 0
+
+
+class SessionLinkEmailListReq(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+
+
 def _pick_proxy_from_pool(text: str, tester=None) -> str:
     return pick_random_usable_proxy(text, tester=tester)
+
+
+def _checked_session_link_result(result: dict, default_error: str) -> dict:
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", default_error))
+    return result
 
 
 # ──────────────────────── API ────────────────────────
@@ -151,6 +174,48 @@ def api_session_link_payment_modes():
     return {"ok": True, "modes": session_link.CONTROLLER.payment_modes()}
 
 
+@app.post("/api/session-link/accounts/import-registered")
+def api_session_link_import_registered(req: SessionLinkImportRegisteredReq):
+    result = session_link.CONTROLLER.import_registered(req.emails)
+    return _checked_session_link_result(result, "导入失败")
+
+
+@app.get("/api/session-link/accounts")
+def api_session_link_accounts(status: str = "", limit: int = 500):
+    result = session_link.CONTROLLER.accounts(status=status, limit=limit)
+    return _checked_session_link_result(result, "读取账号失败")
+
+
+@app.post("/api/session-link/accounts/run-selected")
+def api_session_link_run_selected(req: SessionLinkRunSelectedReq):
+    result = session_link.CONTROLLER.run_selected(req.model_dump())
+    return _checked_session_link_result(result, "启动失败")
+
+
+@app.post("/api/session-link/accounts/stop")
+def api_session_link_stop():
+    result = session_link.CONTROLLER.stop()
+    return _checked_session_link_result(result, "停止失败")
+
+
+@app.post("/api/session-link/accounts/reset")
+def api_session_link_reset(req: SessionLinkEmailListReq):
+    result = session_link.CONTROLLER.reset(req.emails)
+    return _checked_session_link_result(result, "重置失败")
+
+
+@app.post("/api/session-link/accounts/delete")
+def api_session_link_delete(req: SessionLinkEmailListReq):
+    result = session_link.CONTROLLER.delete(req.emails)
+    return _checked_session_link_result(result, "删除失败")
+
+
+@app.get("/api/session-link/accounts/{email}/logs")
+def api_session_link_logs(email: str):
+    result = session_link.CONTROLLER.logs(email)
+    return _checked_session_link_result(result, "读取日志失败")
+
+
 @app.post("/api/session-link/run-once")
 def api_session_link_run_once(req: SessionLinkReq):
     result = session_link.CONTROLLER.generate_once(req.model_dump())
@@ -168,7 +233,7 @@ def api_session_link_start(req: SessionLinkReq):
 
 
 @app.post("/api/session-link/stop")
-def api_session_link_stop():
+def api_session_link_legacy_stop():
     return session_link.CONTROLLER.stop()
 
 

@@ -945,4 +945,30 @@
   - 后端默认线程池 `max_workers=10`；新增“停止次数”参数，默认 0 表示直至成功，非 0 时按撞链次数达到上限仍未成功则停止该账号。
 - [x] Document validated design
   - 已写入 `docs/plans/2026-06-27-session-link-account-workbench-design.md`。
-- [ ] Prepare implementation plan if approved
+- [x] Prepare implementation plan if approved
+  - 已写入 `docs/plans/2026-06-27-session-link-account-workbench-implementation.md`。
+
+## 2026-06-27 - 链接生成账号工作台实现结果
+
+- [x] DB schema/helpers
+  - 新增 `session_link_accounts` / `session_link_logs`，并给 `registered` 增加 `payment_link`。
+- [x] Core phase callbacks
+  - 链接核心支持阶段回调：`create_checkout`、`stripe_init`、`paypal_approve`。
+- [x] Account controller
+  - email 作为唯一账号 ID；重复导入更新。
+  - 状态机：`pending/check_proxy/create_checkout/stripe_init/paypal_approve/retry_wait/done/failed/stopped/missing_token`。
+  - 代理池来自数据导入页代理池；代理检查失败不计撞链次数。
+  - 撞链失败后不重复代理检查，复用已选可用代理继续 `create_checkout -> paypal_approve`。
+  - 默认 `max_workers=10`；`stop_after=0` 表示直至成功。
+- [x] FastAPI endpoints
+  - 新增导入、列表、执行选中、停止、重置、删除、日志接口。
+- [x] Frontend integration
+  - 注册结果表新增“导入到链接生成”按钮和“支付链接”列。
+  - 链接生成页改为账号工作台，顶部放支付模式、目标金额、失败间隔秒数、停止次数、刷新、执行选中、停止、重置选中、删除选中。
+  - 每账号显示账号、当前代理、尝试次数、撞链次数、状态机、支付模式、目标金额、最终链接、错误、更新时间和日志按钮。
+- [x] Verification
+  - `python -m unittest discover -s tests`：99 tests OK。
+  - `python -m py_compile session_link_gen\core.py webui\session_link.py webui\app.py webui\db.py start_webui.py`：通过。
+  - `node --check webui\static\app.js`：通过。
+  - `git diff --check -- session_link_gen webui tests docs`：无空白错误。
+  - BOM 检查：NO_BOM。
