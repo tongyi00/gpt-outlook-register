@@ -3,15 +3,44 @@
   - 验收：email 唯一；代理池随机探测直到找到可用代理；代理失败不计撞链；停止次数按撞链次数生效；ChatGPT 表显示支付链接；链接生成页无线程数、顶部操作齐全；测试和浏览器验证通过。
 - [x] Locate existing implementation / patterns
   - 设计文档：`docs/plans/2026-06-27-session-link-account-workbench-design.md`。
+  - 实施计划：`docs/plans/2026-06-27-session-link-account-workbench-implementation.md`。
   - 现有链接核心：`session_link_gen/core.py`。
   - 现有链接控制器：`webui/session_link.py`。
   - 注册结果存储与表格：`webui/db.py`、`webui/static/index.html`、`webui/static/app.js`。
 - [x] Design: minimal approach + key decisions
   - 独立 `session_link_accounts` / `session_link_logs`，`registered.payment_link` 做回显。
   - 后端固定线程池默认 `max_workers=10`。
-  - 实施计划已写入 `docs/plans/2026-06-27-session-link-account-workbench-implementation.md`。
-- [ ] Implement smallest safe slice
-- [ ] Add/adjust tests
-- [ ] Run verification (lint/tests/build/manual repro)
-- [ ] Summarize changes + verification story
-- [ ] Record lessons (if any)
+  - 状态机：`pending/check_proxy/create_checkout/stripe_init/paypal_approve/retry_wait/done/failed/stopped/missing_token`。
+- [x] Task 1: DB schema/helpers
+  - 提交：`59c830f`、`12142d7`。
+- [x] Task 2: core phase callbacks
+  - 提交：`8094d5d`。
+- [x] Task 3: account controller quality re-review
+  - 提交：`37a0e95`、`0a3bc19`、`90a1d7c`。
+  - 复查结论：reset/delete 与 run_selected 的 TOCTOU 已关闭；proxy_pool 异常日志已脱敏。
+- [x] Task 4: FastAPI account endpoints
+  - 提交：`0d2273b`。
+  - 已通过 spec review 和 code quality review。
+- [x] Task 5: ChatGPT registered table integration
+  - 提交：`6465d70`。
+  - 已通过 spec review 和 code quality review。
+  - 导入按钮、支付链接列、导入成功不切换 tab。
+- [x] Task 6: Session Link workbench UI
+  - 提交：`b685112`。
+  - 已通过 spec review 和 code quality review。
+  - 顶部参数/操作行、账号表格、日志入口、无线程数。
+- [x] Task 7: final review fix
+  - 发现：撞链失败重试会重复进入 `check_proxy` 并重新探测代理池，不符合“代理可用后只重复 create_checkout 到 paypal_approve”的要求。
+  - 修复：账号任务先检查代理直到拿到可用代理；随后撞链重试复用同一个代理，只增加撞链次数。
+  - 覆盖：新增 `test_collision_retry_reuses_selected_proxy_without_rechecking_pool`，先红后绿。
+- [x] Task 8: full verification
+  - `python -m unittest discover -s tests`：99 tests OK。
+  - `python -m py_compile session_link_gen\core.py webui\session_link.py webui\app.py webui\db.py start_webui.py`：通过。
+  - `node --check webui\static\app.js`：通过。
+  - `git diff --check -- session_link_gen webui tests docs`：无空白错误，仅 Windows 换行提示。
+  - BOM 检查：NO_BOM。
+  - 浏览器检查：此前已在 `http://127.0.0.1:8766/` 验证桌面/移动端无 console error；本次只改后端循环与单测，未改 UI。
+- [x] Summarize changes + verification story
+  - 结果：链接生成工作台支持从 ChatGPT 注册表导入账号、按选中账号执行、状态机/撞链次数/停止次数/日志/支付链接回写；最终复查补齐“撞链重试不重复代理检查”。
+- [x] Record lessons (if any)
+  - 已记录到 `tasks/lessons.md`。

@@ -460,10 +460,15 @@ class SessionLinkController:
                     self._account_state["status"] = "done"
 
     def _run_account_loop(self, email: str, config: dict) -> None:
+        access_token = ""
+        started_at = None
+        proxy_url = ""
+        proxy_label = "直连"
+
         while not self._account_stop.is_set():
             row = db.get_session_link_account(email) or {}
             attempts = int(row.get("attempts") or 0) + 1
-            started_at = row.get("started_at") or time.time()
+            started_at = row.get("started_at") or started_at or time.time()
             db.update_session_link_account(
                 email,
                 attempts=attempts,
@@ -506,7 +511,32 @@ class SessionLinkController:
                 continue
 
             proxy_label = mask_proxy_url(proxy_url) if proxy_url else "直连"
+            db.update_session_link_account(email, proxy_url=proxy_label)
+            break
+
+        if self._account_stop.is_set():
+            self._mark_account_stopped(email)
+            return
+
+        first_collision = True
+        while not self._account_stop.is_set():
             row = db.get_session_link_account(email) or {}
+            if not first_collision:
+                attempts = int(row.get("attempts") or 0) + 1
+                db.update_session_link_account(
+                    email,
+                    attempts=attempts,
+                    error=None,
+                    long_url=None,
+                    payment_mode=config["payment_mode"],
+                    target_amount=config["target_amount"],
+                    started_at=started_at,
+                    finished_at=None,
+                )
+                self._append_account_log(email, "info", "retry", f"Attempt {attempts}")
+                row = db.get_session_link_account(email) or {}
+            first_collision = False
+
             collision_count = int(row.get("collision_count") or 0) + 1
             db.update_session_link_account(
                 email,

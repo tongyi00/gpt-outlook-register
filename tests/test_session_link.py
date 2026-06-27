@@ -589,6 +589,38 @@ class SessionLinkControllerAccountTests(unittest.TestCase):
 
         self.with_db(run)
 
+    def test_collision_retry_reuses_selected_proxy_without_rechecking_pool(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            seen_proxies = []
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                seen_proxies.append(proxy_url)
+                if len(seen_proxies) == 1:
+                    raise RuntimeError("temporary collision")
+                return self.success_result()
+
+            with patch("webui.session_link.pick_random_usable_proxy", return_value="http://proxy-good") as choose, \
+                    patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "proxy_pool": "http://proxy-good\nhttp://proxy-bad",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("a@example.com", lambda item: item["status"] == "done")
+                self.wait_for_batch(controller)
+
+            choose.assert_called_once()
+            self.assertEqual(len(seen_proxies), 2)
+            self.assertEqual(seen_proxies[0], seen_proxies[1])
+            self.assertIn("proxy-good", seen_proxies[0])
+            self.assertEqual(row["collision_count"], 2)
+
+        self.with_db(run)
+
     def test_success_writes_account_long_url_and_registered_payment_link(self):
         def run():
             controller = SessionLinkController()
