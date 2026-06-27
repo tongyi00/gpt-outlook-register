@@ -46,6 +46,20 @@ function classifyLog(line) {
   return "";
 }
 
+function _openSafeHttpUrl(url) {
+  try {
+    const parsed = new URL(String(url || "").trim());
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error("unsupported url scheme");
+    }
+    window.open(parsed.href, "_blank", "noopener");
+    return true;
+  } catch (_) {
+    alert("链接格式不安全，已拒绝打开");
+    return false;
+  }
+}
+
 // ──────────────────────── 统计栏 ────────────────────────
 
 async function refreshStats() {
@@ -234,7 +248,7 @@ const PAGE_META = {
   pool: ["号池", "Outlook 接码号"],
   registered: ["运行记录", ""],
   customsms: ["手机号池", ""],
-  sessionlink: ["链接生成", "循环生成付款链接"],
+  sessionlink: ["链接生成", "账号级付款链接工作台"],
   proxypool: ["数据导入", ""],
   runs: ["运行记录", ""],
   mailcfg: ["数据导入", ""],
@@ -316,6 +330,15 @@ $$("input[name=\"dataImportView\"]").forEach((input) => {
 
 let sessionLinkModesLoaded = false;
 let sessionLinkPollTimer = null;
+let sessionLinkAccountsCache = [];
+let sessionLinkAccountsRequestSeq = 0;
+const SESSION_LINK_ACTIVE_STATUSES = new Set([
+  "check_proxy",
+  "create_checkout",
+  "stripe_init",
+  "paypal_approve",
+  "retry_wait",
+]);
 
 async function loadSessionLinkModes() {
   if (sessionLinkModesLoaded) return;
@@ -338,175 +361,228 @@ async function loadSessionLinkModes() {
 
 function _sessionLinkPayload() {
   return {
-    session_text: $("#sessionLinkInput").value.trim(),
+    emails: _selectedSessionLinkEmails(),
     payment_mode: $("#sessionLinkMode").value,
     target_amount: $("#sessionLinkTargetAmount").value.trim() || "0",
-    thread_count: parseInt($("#sessionLinkThreadCount").value || "1", 10),
     delay_seconds: parseInt($("#sessionLinkDelaySeconds").value || "2", 10),
-    payment_proxy_pool: $("#sessionLinkPaymentProxyPool").value.trim(),
+    stop_after: parseInt($("#sessionLinkStopAfter").value || "0", 10),
+    proxy_pool: $("#autoProxyPool").value.trim(),
   };
 }
 
-function _sessionLinkStatusText(state) {
-  const statusMap = {
-    idle: "未运行",
-    running: "运行中",
-    done: "已完成",
-    failed: "失败",
-    stopped: "已停止",
+function _sessionLinkStatusLabel(status) {
+  const labels = {
+    pending: "pending",
+    check_proxy: "check proxy",
+    create_checkout: "create checkout",
+    stripe_init: "stripe init",
+    paypal_approve: "paypal approve",
+    retry_wait: "retry wait",
+    done: "done",
+    failed: "failed",
+    stopped: "stopped",
+    missing_token: "missing token",
   };
-  const title = statusMap[state.status] || state.status || "未运行";
-  const parts = [
-    title,
-    `轮次 ${state.attempt || 0}`,
-    `成功 ${state.success_count || 0}`,
-    `待重试 ${state.pending_count || 0}`,
-  ];
-  if (state.last_error) parts.push(`最近错误: ${state.last_error}`);
-  return parts.join("  |  ");
+  return labels[status] || status || "pending";
 }
 
-function _sessionLinkResultHtml(state) {
-  const results = state.results || [];
-  if (!results.length) return '<div class="empty">暂无生成结果</div>';
-  const summary = `
-    <div class="session-link-summary">
-      <span>总数 ${escapeHtml(state.total || 0)} / 成功 ${escapeHtml(state.success_count || 0)} / 失败 ${escapeHtml(state.failure_count || 0)}</span>
-      <span>线程 ${escapeHtml(state.thread_count || 1)}</span>
+function _sessionLinkLinkHtml(url) {
+  const link = String(url || "").trim();
+  if (!link) return "—";
+  const label = link.length > 44 ? `${link.slice(0, 25)}...${link.slice(-12)}` : link;
+  return `
+    <div class="session-link-final-link">
+      <span title="${escapeHtml(link)}">${escapeHtml(label)}</span>
+      <button data-session-link-copy="${escapeHtml(link)}" type="button">复制</button>
+      <button data-session-link-open="${escapeHtml(link)}" type="button">打开</button>
     </div>
   `;
-  const rows = results.map((item) => {
-    const ok = !item.error;
-    const cls = ok ? "ok" : "bad";
-    const title = `#${Number(item.index || 0) + 1} ${ok ? "成功" : "失败"}`;
-    const url = item.long_url || "";
-    const actions = ok ? `
-      <div class="session-link-item-actions">
-        <button data-session-link-copy="${escapeHtml(url)}" type="button">复制链接</button>
-        <button data-session-link-open="${escapeHtml(url)}" type="button">打开链接</button>
-      </div>
-    ` : "";
-    return `
-      <div class="session-link-item ${cls}">
-        <div class="session-link-item-head">
-          <span>${escapeHtml(title)}</span>
-          <span class="status-chip muted">${escapeHtml(item.token_preview || "")}</span>
-        </div>
-        ${ok ? `<div class="session-link-url">${escapeHtml(url)}</div>` : `<div class="session-link-error">${escapeHtml(item.error || "生成失败")}</div>`}
-        <div class="session-link-meta">模式 ${escapeHtml(item.payment_mode || state.payment_mode || "")} · 金额 ${escapeHtml(item.stripe_amount || "")} · 目标 ${escapeHtml(item.target_amount || "")} · 代理 ${escapeHtml(item.proxy_used || "直连")}</div>
-        ${actions}
-      </div>
+}
+
+function updateSessionLinkStatus(items) {
+  const total = items.length;
+  const active = items.filter((item) => SESSION_LINK_ACTIVE_STATUSES.has(item.status)).length;
+  const done = items.filter((item) => item.status === "done").length;
+  const failed = items.filter((item) => item.status === "failed").length;
+  const missing = items.filter((item) => item.status === "missing_token").length;
+  $("#sessionLinkStatus").textContent = `账号 ${total} · 运行中 ${active} · 成功 ${done} · 失败 ${failed} · 缺 token ${missing}`;
+  $("#sessionLinkStatus").className = `result ${failed ? "bad" : active ? "" : done ? "ok" : ""}`;
+  $("#sessionLinkStop").disabled = active === 0;
+}
+
+function _selectedSessionLinkEmails() {
+  return Array.from(document.querySelectorAll(".session-link-check:checked")).map((item) => item.dataset.email);
+}
+
+function _updateSessionLinkSelection() {
+  const selected = _selectedSessionLinkEmails();
+  const hasSelected = selected.length > 0;
+  $("#sessionLinkSelCount").textContent = selected.length;
+  $("#sessionLinkRunSelected").disabled = !hasSelected;
+  $("#sessionLinkResetSelected").disabled = !hasSelected;
+  $("#sessionLinkDeleteSelected").disabled = !hasSelected;
+}
+
+function renderSessionLinkAccounts(items) {
+  const selected = new Set(_selectedSessionLinkEmails());
+  sessionLinkAccountsCache = items || [];
+  const tb = $("#sessionLinkAccountTable tbody");
+  tb.innerHTML = "";
+  for (const item of sessionLinkAccountsCache) {
+    const rawEmail = String(item.email || "");
+    const email = escapeHtml(rawEmail);
+    const checked = selected.has(rawEmail) ? " checked" : "";
+    const status = String(item.status || "pending");
+    const statusClass = status.replace(/[^a-z0-9_-]/gi, "_");
+    const error = String(item.error || "");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input type="checkbox" class="session-link-check" data-email="${email}"${checked}></td>
+      <td><code>${email}</code></td>
+      <td title="${escapeHtml(item.proxy_url || "")}">${escapeHtml(item.proxy_url || "直连")}</td>
+      <td>${escapeHtml(item.attempts || 0)}</td>
+      <td>${escapeHtml(item.collision_count || 0)}</td>
+      <td><span class="session-link-status-chip ${escapeHtml(statusClass)}">${escapeHtml(_sessionLinkStatusLabel(status))}</span></td>
+      <td>${escapeHtml(item.payment_mode || "")}</td>
+      <td>${escapeHtml(item.target_amount || "")}</td>
+      <td>${_sessionLinkLinkHtml(item.long_url)}</td>
+      <td class="session-link-error-cell" title="${escapeHtml(error)}">${escapeHtml(error.slice(0, 64))}</td>
+      <td>${fmtTime(item.updated_at || item.finished_at || item.started_at)}</td>
+      <td><button data-session-link-log="${email}" type="button">日志</button></td>
     `;
-  }).join("");
-  return summary + rows;
+    tb.appendChild(tr);
+  }
+  $("#sessionLinkSelectAll").checked = sessionLinkAccountsCache.length > 0 && _selectedSessionLinkEmails().length === sessionLinkAccountsCache.length;
+  _updateSessionLinkSelection();
+  updateSessionLinkStatus(sessionLinkAccountsCache);
 }
 
-function _sessionLinkLogsHtml(logs) {
-  if (!logs || logs.length === 0) return "";
-  return logs.map((row) => {
-    const time = row.time ? fmtTime(row.time) : "-";
-    return `<div class="session-link-log-row ${escapeHtml(row.kind || "")}">${escapeHtml(time)} ${escapeHtml(row.title || "")} ${escapeHtml(row.message || "")}</div>`;
-  }).join("");
+function _invalidateSessionLinkAccountLoads() {
+  sessionLinkAccountsRequestSeq += 1;
 }
 
-function renderSessionLinkStatus(state) {
-  const running = !!state.running;
-  $("#sessionLinkStatus").textContent = _sessionLinkStatusText(state);
-  $("#sessionLinkStatus").className = `status-panel ${state.status === "done" ? "ok" : state.status === "failed" ? "bad" : ""}`;
-  $("#sessionLinkResult").innerHTML = _sessionLinkResultHtml(state);
-  $("#sessionLinkLogs").innerHTML = _sessionLinkLogsHtml(state.logs || []);
-  $("#sessionLinkRunOnce").disabled = running;
-  $("#sessionLinkStart").disabled = running;
-  $("#sessionLinkStop").disabled = !running;
+async function loadSessionLinkAccounts() {
+  const requestSeq = ++sessionLinkAccountsRequestSeq;
+  try {
+    const result = await api("/api/session-link/accounts");
+    if (requestSeq !== sessionLinkAccountsRequestSeq) return;
+    renderSessionLinkAccounts(result.items || []);
+  } catch (err) {
+    if (requestSeq !== sessionLinkAccountsRequestSeq) return;
+    $("#sessionLinkStatus").textContent = "账号加载失败: " + err.message;
+    $("#sessionLinkStatus").className = "result bad";
+  }
 }
 
 async function refreshSessionLinkStatus() {
-  try {
-    const state = await api("/api/session-link/status");
-    renderSessionLinkStatus(state);
-  } catch (err) {
-    $("#sessionLinkStatus").textContent = "状态加载失败: " + err.message;
-    $("#sessionLinkStatus").className = "status-panel bad";
-  }
+  await loadSessionLinkAccounts();
 }
 
 function ensureSessionLinkPolling() {
   if (sessionLinkPollTimer) return;
   sessionLinkPollTimer = setInterval(() => {
     const active = !$("#tab-sessionlink")?.classList.contains("hidden");
-    const running = !$("#sessionLinkStop")?.disabled;
-    if (active || running) refreshSessionLinkStatus();
+    const running = sessionLinkAccountsCache.some((item) => SESSION_LINK_ACTIVE_STATUSES.has(item.status));
+    if (active || running) loadSessionLinkAccounts();
   }, 2000);
 }
 
-$("#sessionLinkRunOnce")?.addEventListener("click", async () => {
-  if (!$("#sessionLinkInput").value.trim()) {
-    $("#sessionLinkStatus").textContent = "请先粘贴 Session JSON / Access Token";
-    $("#sessionLinkStatus").className = "status-panel bad";
-    return;
-  }
-  $("#sessionLinkRunOnce").disabled = true;
-  $("#sessionLinkStatus").textContent = "生成中...";
-  try {
-    const result = await api("/api/session-link/run-once", {
-      method: "POST",
-      body: JSON.stringify(_sessionLinkPayload()),
-    });
-    renderSessionLinkStatus({
-      running: false,
-      status: result.success_count > 0 ? "done" : "failed",
-      attempt: 1,
-      total: result.total,
-      success_count: result.success_count,
-      failure_count: result.failure_count,
-      pending_count: result.failure_count,
-      thread_count: result.thread_count,
-      payment_mode: result.payment_mode,
-      results: result.results,
-      logs: [],
-    });
-  } catch (err) {
-    $("#sessionLinkStatus").textContent = "生成失败: " + err.message;
-    $("#sessionLinkStatus").className = "status-panel bad";
-  } finally {
-    $("#sessionLinkRunOnce").disabled = false;
-  }
+$("#sessionLinkRefresh")?.addEventListener("click", loadSessionLinkAccounts);
+
+$("#sessionLinkSelectAll")?.addEventListener("change", (e) => {
+  document.querySelectorAll(".session-link-check").forEach((item) => { item.checked = e.target.checked; });
+  _updateSessionLinkSelection();
 });
 
-$("#sessionLinkStart")?.addEventListener("click", async () => {
-  if (!$("#sessionLinkInput").value.trim()) {
-    $("#sessionLinkStatus").textContent = "请先粘贴 Session JSON / Access Token";
-    $("#sessionLinkStatus").className = "status-panel bad";
-    return;
-  }
-  $("#sessionLinkStart").disabled = true;
-  $("#sessionLinkStatus").textContent = "启动循环中...";
+$("#sessionLinkAccountTable")?.addEventListener("change", (e) => {
+  if (e.target.classList.contains("session-link-check")) _updateSessionLinkSelection();
+});
+
+$("#sessionLinkRunSelected")?.addEventListener("click", async () => {
+  const emails = _selectedSessionLinkEmails();
+  if (!emails.length) return;
+  _invalidateSessionLinkAccountLoads();
+  $("#sessionLinkRunSelected").disabled = true;
+  $("#sessionLinkStatus").textContent = "启动选中账号中...";
   try {
-    const state = await api("/api/session-link/start", {
+    await api("/api/session-link/accounts/run-selected", {
       method: "POST",
       body: JSON.stringify(_sessionLinkPayload()),
     });
-    renderSessionLinkStatus(state);
+    await loadSessionLinkAccounts();
     ensureSessionLinkPolling();
   } catch (err) {
     $("#sessionLinkStatus").textContent = "启动失败: " + err.message;
-    $("#sessionLinkStatus").className = "status-panel bad";
-    $("#sessionLinkStart").disabled = false;
+    $("#sessionLinkStatus").className = "result bad";
+    _updateSessionLinkSelection();
   }
 });
 
 $("#sessionLinkStop")?.addEventListener("click", async () => {
+  _invalidateSessionLinkAccountLoads();
   $("#sessionLinkStop").disabled = true;
   try {
-    const state = await api("/api/session-link/stop", { method: "POST" });
-    renderSessionLinkStatus(state);
+    await api("/api/session-link/accounts/stop", { method: "POST" });
+    await loadSessionLinkAccounts();
   } catch (err) {
     $("#sessionLinkStatus").textContent = "停止失败: " + err.message;
-    $("#sessionLinkStatus").className = "status-panel bad";
+    $("#sessionLinkStatus").className = "result bad";
+    updateSessionLinkStatus(sessionLinkAccountsCache);
   }
 });
 
-$("#sessionLinkResult")?.addEventListener("click", async (e) => {
+$("#sessionLinkResetSelected")?.addEventListener("click", async () => {
+  const emails = _selectedSessionLinkEmails();
+  if (!emails.length) return;
+  _invalidateSessionLinkAccountLoads();
+  $("#sessionLinkResetSelected").disabled = true;
+  try {
+    await api("/api/session-link/accounts/reset", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    await loadSessionLinkAccounts();
+  } catch (err) {
+    $("#sessionLinkStatus").textContent = "重置失败: " + err.message;
+    $("#sessionLinkStatus").className = "result bad";
+    _updateSessionLinkSelection();
+  }
+});
+
+$("#sessionLinkDeleteSelected")?.addEventListener("click", async () => {
+  const emails = _selectedSessionLinkEmails();
+  if (!emails.length) return;
+  if (!confirm(`删除选中的 ${emails.length} 个链接生成账号？`)) return;
+  _invalidateSessionLinkAccountLoads();
+  $("#sessionLinkDeleteSelected").disabled = true;
+  try {
+    await api("/api/session-link/accounts/delete", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    await loadSessionLinkAccounts();
+  } catch (err) {
+    $("#sessionLinkStatus").textContent = "删除失败: " + err.message;
+    $("#sessionLinkStatus").className = "result bad";
+    _updateSessionLinkSelection();
+  }
+});
+
+async function openSessionLinkLogs(email) {
+  const result = await api(`/api/session-link/accounts/${encodeURIComponent(email)}/logs`);
+  $("#sessionLinkLogTitle").textContent = `${email} 日志`;
+  const rows = result.items || [];
+  $("#sessionLinkLogBody").innerHTML = rows.length ? rows.map((row) => `
+    <div class="session-link-log-row ${escapeHtml(row.kind || "")}">
+      <span>${escapeHtml(fmtTime(row.created_at || row.time))}</span>
+      <span>${escapeHtml(row.stage || "")}</span>
+      <pre>${escapeHtml(row.message || "")}</pre>
+    </div>
+  `).join("") : '<div class="empty">暂无日志</div>';
+  $("#sessionLinkLogModal").classList.remove("hidden");
+}
+
+$("#sessionLinkAccountTable")?.addEventListener("click", async (e) => {
   const copyBtn = e.target.closest("button[data-session-link-copy]");
   if (copyBtn) {
     await _copyText(copyBtn.dataset.sessionLinkCopy, copyBtn);
@@ -514,8 +590,22 @@ $("#sessionLinkResult")?.addEventListener("click", async (e) => {
   }
   const openBtn = e.target.closest("button[data-session-link-open]");
   if (openBtn) {
-    window.open(openBtn.dataset.sessionLinkOpen, "_blank", "noopener");
+    _openSafeHttpUrl(openBtn.dataset.sessionLinkOpen);
+    return;
   }
+  const logBtn = e.target.closest("button[data-session-link-log]");
+  if (logBtn) {
+    try {
+      await openSessionLinkLogs(logBtn.dataset.sessionLinkLog);
+    } catch (err) {
+      $("#sessionLinkStatus").textContent = "日志加载失败: " + err.message;
+      $("#sessionLinkStatus").className = "result bad";
+    }
+  }
+});
+
+$("#sessionLinkLogClose")?.addEventListener("click", () => {
+  $("#sessionLinkLogModal").classList.add("hidden");
 });
 
 // ──────────────────────── 号池列表 ────────────────────────
@@ -865,7 +955,7 @@ $("#regTable").addEventListener("click", async (e) => {
     return;
   }
   if (btn.dataset.sessionLinkOpen) {
-    window.open(btn.dataset.sessionLinkOpen, "_blank", "noopener");
+    _openSafeHttpUrl(btn.dataset.sessionLinkOpen);
     return;
   }
   const email = btn.dataset.email;

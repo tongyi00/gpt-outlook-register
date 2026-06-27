@@ -79,7 +79,7 @@ class CustomSmsStaticUiTests(unittest.TestCase):
         self.assertIn('const HIDE_STATS_TABS = new Set(["customsms", "sessionlink", "mailcfg", "exportcfg"])', js)
         self.assertIn('$("#statsBar")?.classList.toggle("hidden", HIDE_STATS_TABS.has(tabName))', js)
 
-    def test_business_session_link_tab_exists_and_uses_backend_loop(self):
+    def test_business_session_link_tab_exists_in_business_nav(self):
         html = (ROOT / "webui" / "static" / "index.html").read_text(encoding="utf-8")
         js = (ROOT / "webui" / "static" / "app.js").read_text(encoding="utf-8")
         css = (ROOT / "webui" / "static" / "style.css").read_text(encoding="utf-8")
@@ -94,29 +94,96 @@ class CustomSmsStaticUiTests(unittest.TestCase):
         tab_start = html.index('id="tab-sessionlink"')
         tab_end = html.index('id="tab-mailcfg"', tab_start)
         tab_html = html[tab_start:tab_end]
-        for expected in (
-            'id="sessionLinkInput"',
-            'id="sessionLinkMode"',
-            'id="sessionLinkTargetAmount"',
-            'id="sessionLinkThreadCount"',
-            'id="sessionLinkDelaySeconds"',
-            'id="sessionLinkPaymentProxyPool"',
-            'id="sessionLinkRunOnce"',
-            'id="sessionLinkStart"',
-            'id="sessionLinkStop"',
-            'id="sessionLinkResult"',
-            'id="sessionLinkLogs"',
-        ):
-            self.assertIn(expected, tab_html)
+        self.assertIn('class="card session-link-card"', tab_html)
+        self.assertIn('id="sessionLinkStatus"', tab_html)
 
-        self.assertIn('sessionlink: ["链接生成", "循环生成付款链接"]', js)
-        self.assertIn('api("/api/session-link/start"', js)
-        self.assertIn('api("/api/session-link/stop"', js)
-        self.assertIn('api("/api/session-link/status"', js)
+        self.assertIn('sessionlink: ["链接生成"', js)
         self.assertIn("ensureSessionLinkPolling", js)
         self.assertIn("#tab-sessionlink", css)
         self.assertIn(".session-link-card", css)
-        self.assertIn(".session-link-result", css)
+
+    def test_session_link_tab_is_account_workbench(self):
+        html = (ROOT / "webui" / "static" / "index.html").read_text(encoding="utf-8")
+        js = (ROOT / "webui" / "static" / "app.js").read_text(encoding="utf-8")
+        css = (ROOT / "webui" / "static" / "style.css").read_text(encoding="utf-8")
+
+        tab_start = html.index('id="tab-sessionlink"')
+        tab_end = html.index('id="tab-mailcfg"', tab_start)
+        tab_html = html[tab_start:tab_end]
+
+        for removed in (
+            'id="sessionLinkInput"',
+            'id="sessionLinkThreadCount"',
+            'id="sessionLinkPaymentProxyPool"',
+            'id="sessionLinkRunOnce"',
+            'id="sessionLinkStart"',
+            "生成一次",
+            "开始循环直到生成",
+        ):
+            self.assertNotIn(removed, tab_html)
+
+        for expected in (
+            'id="sessionLinkMode"',
+            'id="sessionLinkTargetAmount"',
+            'id="sessionLinkDelaySeconds"',
+            'id="sessionLinkStopAfter"',
+            'id="sessionLinkRefresh"',
+            'id="sessionLinkRunSelected"',
+            'id="sessionLinkStop"',
+            'id="sessionLinkResetSelected"',
+            'id="sessionLinkDeleteSelected"',
+            'id="sessionLinkAccountTable"',
+            'id="sessionLinkSelectAll"',
+            'id="sessionLinkSelCount"',
+            'id="sessionLinkStatus"',
+        ):
+            self.assertIn(expected, tab_html)
+
+        self.assertIn("账号", tab_html)
+        self.assertIn("当前代理", tab_html)
+        self.assertIn("尝试次数", tab_html)
+        self.assertIn("撞链次数", tab_html)
+        self.assertIn("链接生成状态机", tab_html)
+        self.assertIn("最终生成的链接", tab_html)
+        self.assertIn("日志", tab_html)
+
+        toolbar_start = tab_html.index("session-link-toolbar")
+        table_start = tab_html.index('id="sessionLinkAccountTable"')
+        toolbar_html = tab_html[toolbar_start:table_start]
+        self.assertLess(toolbar_html.index('id="sessionLinkMode"'), toolbar_html.index('id="sessionLinkRefresh"'))
+        self.assertLess(toolbar_html.index('id="sessionLinkStopAfter"'), toolbar_html.index('id="sessionLinkRunSelected"'))
+
+        self.assertIn("sessionlink: [\"链接生成\", \"账号级付款链接工作台\"]", js)
+        self.assertIn("function loadSessionLinkAccounts", js)
+        self.assertIn("let sessionLinkAccountsRequestSeq = 0", js)
+        self.assertIn("const requestSeq = ++sessionLinkAccountsRequestSeq", js)
+        self.assertIn("if (requestSeq !== sessionLinkAccountsRequestSeq) return", js)
+        self.assertIn("function _selectedSessionLinkEmails", js)
+        self.assertIn("function renderSessionLinkAccounts", js)
+        self.assertIn("function _openSafeHttpUrl", js)
+        self.assertIn('if (!["http:", "https:"].includes(parsed.protocol))', js)
+        self.assertIn('_openSafeHttpUrl(openBtn.dataset.sessionLinkOpen)', js)
+        self.assertNotIn('window.open(openBtn.dataset.sessionLinkOpen', js)
+        self.assertIn('api("/api/session-link/accounts"', js)
+        self.assertIn('api("/api/session-link/accounts/run-selected"', js)
+        self.assertIn('api("/api/session-link/accounts/stop"', js)
+        self.assertIn('api("/api/session-link/accounts/reset"', js)
+        self.assertIn('api("/api/session-link/accounts/delete"', js)
+        self.assertIn('/api/session-link/accounts/${encodeURIComponent(email)}/logs', js)
+        self.assertIn('proxy_pool: $("#autoProxyPool").value.trim()', js)
+        self.assertNotIn('api("/api/session-link/run-once"', js)
+        self.assertNotIn('api("/api/session-link/start"', js)
+        self.assertNotIn('api("/api/session-link/status"', js)
+        self.assertNotIn("sessionLinkThreadCount", js)
+
+        self.assertIn(".session-link-toolbar", css)
+        self.assertIn(".toolbar.session-link-toolbar", css)
+        self.assertIn(".session-link-mode-field", css)
+        self.assertIn(".session-link-table-panel", css)
+        self.assertIn(".session-link-status-chip", css)
+        self.assertIn(".session-link-log-modal", css)
+        self.assertIn(".session-link-log-modal .session-link-log-row", css)
+        self.assertNotIn("\n.session-link-log-row", css)
 
     def test_data_import_contains_mail_sms_and_proxy_pool_panels(self):
         html = (ROOT / "webui" / "static" / "index.html").read_text(encoding="utf-8")

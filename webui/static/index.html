@@ -269,44 +269,48 @@
 
       <section class="tab-content page-section hidden" id="tab-sessionlink" data-screen-label="05 Session Link">
         <section class="card session-link-card">
-          <div class="session-link-grid">
-            <div class="session-link-config">
-              <label>Session JSON / Access Token
-                <textarea id="sessionLinkInput" rows="12" placeholder="粘贴 Session JSON、Bearer access_token，或每行一个 access_token"></textarea>
-              </label>
-              <div class="field-grid session-link-fields">
-                <label>支付模式
-                  <select id="sessionLinkMode">
-                    <option value="PayPal 长链接 US/USD">PayPal 长链接 US/USD</option>
-                  </select>
-                </label>
-                <label>目标金额
-                  <input id="sessionLinkTargetAmount" value="0" placeholder="0">
-                </label>
-                <label>线程数
-                  <input id="sessionLinkThreadCount" type="number" value="1" min="1" max="50">
-                </label>
-                <label>失败间隔秒数
-                  <input id="sessionLinkDelaySeconds" type="number" value="2" min="0" max="86400">
-                </label>
-              </div>
-              <label>付款代理池
-                <textarea id="sessionLinkPaymentProxyPool" rows="5" placeholder="每行一个代理；留空则直连&#10;socks5://127.0.0.1:7890&#10;http://host:8080"></textarea>
-              </label>
-            </div>
-
-            <div class="session-link-run">
-              <div id="sessionLinkStatus" class="status-panel">未运行</div>
-              <div class="action-row session-link-actions">
-                <button id="sessionLinkRunOnce" type="button">生成一次</button>
-                <button id="sessionLinkStart" class="primary" type="button">开始循环直到生成</button>
-                <button id="sessionLinkStop" type="button" disabled>停止</button>
-              </div>
-              <div id="sessionLinkResult" class="session-link-result">
-                <div class="empty">暂无生成结果</div>
-              </div>
-              <div id="sessionLinkLogs" class="session-link-logs"></div>
-            </div>
+          <div class="toolbar session-link-toolbar">
+            <label class="session-link-mode-field">支付模式
+              <select id="sessionLinkMode">
+                <option value="PayPal 长链接 US/USD">PayPal 长链接 US/USD</option>
+              </select>
+            </label>
+            <label class="session-link-number-field">目标金额
+              <input id="sessionLinkTargetAmount" value="0" placeholder="0">
+            </label>
+            <label class="session-link-number-field">失败间隔秒数
+              <input id="sessionLinkDelaySeconds" type="number" value="2" min="0" max="86400">
+            </label>
+            <label class="session-link-number-field">停止次数
+              <input id="sessionLinkStopAfter" type="number" value="0" min="0" max="1000000">
+            </label>
+            <span class="toolbar-spacer"></span>
+            <button id="sessionLinkRefresh" type="button">刷新</button>
+            <button id="sessionLinkRunSelected" class="primary" type="button" disabled>执行选中</button>
+            <button id="sessionLinkStop" type="button" disabled>停止</button>
+            <button id="sessionLinkResetSelected" type="button" disabled>重置选中</button>
+            <button id="sessionLinkDeleteSelected" class="danger" type="button" disabled>删除选中</button>
+            <span class="session-link-count">已选 <span id="sessionLinkSelCount">0</span></span>
+            <span id="sessionLinkStatus" class="result">未运行</span>
+          </div>
+          <div class="table-panel session-link-table-panel">
+            <table id="sessionLinkAccountTable">
+              <thead><tr>
+                <th><input type="checkbox" id="sessionLinkSelectAll" title="全选/全不选"></th>
+                <th>账号</th>
+                <th>当前代理</th>
+                <th>尝试次数</th>
+                <th>撞链次数</th>
+                <th>链接生成状态机</th>
+                <th>支付模式</th>
+                <th>目标金额</th>
+                <th>最终生成的链接</th>
+                <th>错误</th>
+                <th>更新时间</th>
+                <th>日志</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
           </div>
         </section>
       </section>
@@ -569,6 +573,16 @@
       <button id="credClose" type="button">关闭</button>
     </div>
     <div id="credFields" class="cred-fields"></div>
+  </div>
+</div>
+
+<div class="modal hidden session-link-log-modal" id="sessionLinkLogModal">
+  <div class="modal-body">
+    <div class="modal-head">
+      <h3 id="sessionLinkLogTitle">链接生成日志</h3>
+      <button id="sessionLinkLogClose" type="button">关闭</button>
+    </div>
+    <div id="sessionLinkLogBody" class="session-link-log-body"></div>
   </div>
 </div>
 
