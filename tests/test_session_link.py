@@ -1,9 +1,14 @@
+import sqlite3
+import tempfile
+import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from session_link_gen import core as session_link_core
 from webui import app as web_app
+from webui import db
 from webui.session_link import SessionLinkController, result_error
 
 
@@ -120,6 +125,279 @@ class SessionLinkControllerTests(unittest.TestCase):
         }, "PayPal 长链接 US/USD")
 
         self.assertIn("PayPal BA approve", err)
+
+
+class SessionLinkControllerAccountTests(unittest.TestCase):
+    def with_db(self, callback):
+        with tempfile.TemporaryDirectory() as td:
+            test_db = Path(td) / "webui.db"
+            connections = []
+
+            def open_conn():
+                con = sqlite3.connect(str(test_db), check_same_thread=False, timeout=30)
+                con.row_factory = sqlite3.Row
+                connections.append(con)
+                return con
+
+            try:
+                with patch.object(db, "_conn", side_effect=open_conn):
+                    db.init_db()
+                    callback()
+            finally:
+                for con in connections:
+                    con.close()
+
+    def wait_for_account(self, email, predicate, timeout=3):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = db.get_session_link_account(email)
+            if last and predicate(last):
+                return last
+            time.sleep(0.02)
+        self.fail(f"account {email} did not reach expected state; last={last}")
+
+    def wait_for_batch(self, controller, timeout=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with controller._lock:
+                running = controller._account_state.get("running")
+            if not running:
+                return
+            time.sleep(0.02)
+        self.fail(f"batch did not stop; state={controller._account_state}")
+
+    def save_registered_and_import(self, email="a@example.com", token="token-a"):
+        db.save_registered({"email": email, "access_token": token})
+        db.import_session_link_accounts([email])
+
+    def success_result(self, url="https://www.paypal.com/agreements/approve?ba_token=BA-ok"):
+        return {
+            "long_url": url,
+            "stripe_amount": "0",
+            "stripe_amount_source": "total_summary.due",
+            "target_amount": "0",
+            "amount_matched": True,
+        }
+
+    def test_import_registered_imports_accounts_without_exposing_tokens(self):
+        def run():
+            controller = SessionLinkController()
+            db.save_registered({"email": "a@example.com", "access_token": "secret-token"})
+
+            result = controller.import_registered([" A@example.com "])
+            accounts = controller.accounts()["items"]
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["imported"], 1)
+            self.assertNotIn("secret-token", str(result))
+            self.assertNotIn("access_token", accounts[0])
+            self.assertNotIn("secret-token", str(accounts))
+            self.assertEqual(accounts[0]["email"], "a@example.com")
+            self.assertEqual(accounts[0]["status"], "pending")
+
+        self.with_db(run)
+
+    def test_accounts_masks_proxy_passwords_in_public_fields(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            db.update_session_link_account(
+                "a@example.com",
+                status="retry_wait",
+                proxy_url="http://user:secretpw@proxy.example:8080",
+                error="failed via http://user:secretpw@proxy.example:8080",
+            )
+
+            accounts = controller.accounts()["items"]
+
+            self.assertEqual(accounts[0]["proxy_url"], "http://user:***@proxy.example:8080")
+            self.assertNotIn("secretpw", str(accounts))
+
+        self.with_db(run)
+
+    def test_run_selected_starts_background_job_and_returns_running_status(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                entered.set()
+                release.wait(2)
+                return self.success_result()
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["running"])
+                self.assertEqual(result["status"], "running")
+                self.assertTrue(entered.wait(1))
+                release.set()
+                self.wait_for_account("a@example.com", lambda row: row["status"] == "done")
+                self.wait_for_batch(controller)
+
+        self.with_db(run)
+
+    def test_run_selected_marks_missing_token_account(self):
+        def run():
+            controller = SessionLinkController()
+            db.save_registered({"email": "missing@example.com", "access_token": ""})
+            db.import_session_link_accounts(["missing@example.com"])
+
+            with patch("webui.session_link.generate_payment_link") as mocked:
+                result = controller.run_selected({
+                    "emails": ["missing@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("missing@example.com", lambda item: item["status"] == "missing_token")
+                self.wait_for_batch(controller)
+
+            mocked.assert_not_called()
+            self.assertEqual(row["collision_count"], 0)
+
+        self.with_db(run)
+
+    def test_unusable_proxy_pool_retries_without_increasing_collision_count(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+
+            with patch("webui.session_link.pick_random_usable_proxy", return_value="") as choose, \
+                    patch("webui.session_link.generate_payment_link") as mocked:
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "proxy_pool": "http://user:pass@proxy.example:8080",
+                    "delay_seconds": 1,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("a@example.com", lambda item: item["status"] == "retry_wait")
+                controller.stop()
+                self.wait_for_account("a@example.com", lambda item: item["status"] == "stopped")
+                self.wait_for_batch(controller)
+
+            choose.assert_called()
+            mocked.assert_not_called()
+            self.assertEqual(row["collision_count"], 0)
+
+        self.with_db(run)
+
+    def test_create_checkout_stage_increments_collision_count(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                stage_callback("create_checkout")
+                entered.set()
+                release.wait(2)
+                return self.success_result()
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                self.assertTrue(entered.wait(1))
+                row = db.get_session_link_account("a@example.com")
+                self.assertEqual(row["status"], "create_checkout")
+                self.assertEqual(row["collision_count"], 1)
+                release.set()
+                self.wait_for_account("a@example.com", lambda item: item["status"] == "done")
+                self.wait_for_batch(controller)
+
+        self.with_db(run)
+
+    def test_stop_after_two_failed_collisions_marks_account_failed(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            calls = 0
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("collision")
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                    "stop_after": 2,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("a@example.com", lambda item: item["status"] == "failed")
+                self.wait_for_batch(controller)
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(row["collision_count"], 2)
+            self.assertIn("达到停止次数", row["error"])
+
+        self.with_db(run)
+
+    def test_success_writes_account_long_url_and_registered_payment_link(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            long_url = "https://www.paypal.com/agreements/approve?ba_token=BA-success"
+
+            with patch("webui.session_link.generate_payment_link", return_value=self.success_result(long_url)):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("a@example.com", lambda item: item["status"] == "done")
+                self.wait_for_batch(controller)
+
+            registered = db.get_registered("a@example.com")
+            self.assertEqual(row["long_url"], long_url)
+            self.assertEqual(registered["payment_link"], long_url)
+
+        self.with_db(run)
+
+    def test_stop_prevents_retry_after_current_step(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            calls = 0
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                nonlocal calls
+                calls += 1
+                controller.stop()
+                raise RuntimeError("temporary failure")
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                row = self.wait_for_account("a@example.com", lambda item: item["status"] == "stopped")
+                self.wait_for_batch(controller)
+
+            self.assertEqual(calls, 1)
+            self.assertEqual(row["collision_count"], 1)
+            self.assertNotEqual(row["status"], "retry_wait")
+
+        self.with_db(run)
 
 
 class SessionLinkApiTests(unittest.TestCase):
