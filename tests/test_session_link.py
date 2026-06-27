@@ -341,6 +341,102 @@ class SessionLinkControllerAccountTests(unittest.TestCase):
 
         self.with_db(run)
 
+    def test_reset_does_not_interleave_with_run_selected_after_guard(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            reset_entered = threading.Event()
+            release_reset = threading.Event()
+            run_returned = threading.Event()
+            results = {}
+
+            def fake_reset(_emails):
+                reset_entered.set()
+                release_reset.wait(2)
+                return 1
+
+            def do_reset():
+                results["reset"] = controller.reset(["a@example.com"])
+
+            def do_run():
+                results["run"] = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                run_returned.set()
+
+            with patch.object(db, "reset_session_link_accounts", side_effect=fake_reset), \
+                    patch("webui.session_link.generate_payment_link", return_value=self.success_result()):
+                reset_thread = threading.Thread(target=do_reset)
+                reset_thread.start()
+                self.assertTrue(reset_entered.wait(1))
+                run_thread = threading.Thread(target=do_run)
+                run_thread.start()
+                try:
+                    self.assertFalse(run_returned.wait(0.1))
+                finally:
+                    release_reset.set()
+                    reset_thread.join(1)
+                    run_thread.join(1)
+                    if run_returned.is_set():
+                        self.wait_for_batch(controller)
+
+            self.assertFalse(reset_thread.is_alive())
+            self.assertFalse(run_thread.is_alive())
+            self.assertTrue(results["reset"]["ok"])
+            self.assertTrue(results["run"]["ok"])
+
+        self.with_db(run)
+
+    def test_delete_does_not_interleave_with_run_selected_after_guard(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            delete_entered = threading.Event()
+            release_delete = threading.Event()
+            run_returned = threading.Event()
+            results = {}
+
+            def fake_delete(_emails):
+                delete_entered.set()
+                release_delete.wait(2)
+                return 1
+
+            def do_delete():
+                results["delete"] = controller.delete(["a@example.com"])
+
+            def do_run():
+                results["run"] = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                run_returned.set()
+
+            with patch.object(db, "delete_session_link_accounts", side_effect=fake_delete), \
+                    patch("webui.session_link.generate_payment_link", return_value=self.success_result()):
+                delete_thread = threading.Thread(target=do_delete)
+                delete_thread.start()
+                self.assertTrue(delete_entered.wait(1))
+                run_thread = threading.Thread(target=do_run)
+                run_thread.start()
+                try:
+                    self.assertFalse(run_returned.wait(0.1))
+                finally:
+                    release_delete.set()
+                    delete_thread.join(1)
+                    run_thread.join(1)
+                    if run_returned.is_set():
+                        self.wait_for_batch(controller)
+
+            self.assertFalse(delete_thread.is_alive())
+            self.assertFalse(run_thread.is_alive())
+            self.assertTrue(results["delete"]["ok"])
+            self.assertTrue(results["run"]["ok"])
+
+        self.with_db(run)
+
     def test_unhandled_account_worker_exception_marks_batch_failed(self):
         controller = SessionLinkController()
 

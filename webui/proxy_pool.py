@@ -50,7 +50,7 @@ def is_proxy_usable(proxy: str, timeout: float | None = None) -> bool:
             logger.info("[proxy] unusable status=%s proxy=%s", getattr(resp, "status_code", "N/A"), safe_proxy)
         return ok
     except Exception as e:
-        logger.info("[proxy] unusable error=%s proxy=%s", str(e)[:160], safe_proxy)
+        logger.info("[proxy] unusable error=%s proxy=%s", _mask_proxy_url(str(e))[:160], safe_proxy)
         return False
     finally:
         try:

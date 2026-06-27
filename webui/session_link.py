@@ -283,21 +283,21 @@ class SessionLinkController:
             return {"ok": True, **deepcopy(self._account_state)}
 
     def reset(self, emails) -> dict:
+        selected = _email_list(emails)
         with self._lock:
             if self._account_state.get("running"):
                 return {"ok": False, "error": "账号链接任务正在运行，无法重置"}
-        selected = _email_list(emails)
-        count = db.reset_session_link_accounts(selected)
+            count = db.reset_session_link_accounts(selected)
         for email in selected:
             self._append_account_log(email, "info", "reset", "Account reset")
         return {"ok": True, "reset": count}
 
     def delete(self, emails) -> dict:
+        selected = _email_list(emails)
         with self._lock:
             if self._account_state.get("running"):
                 return {"ok": False, "error": "账号链接任务正在运行，无法删除"}
-        selected = _email_list(emails)
-        count = db.delete_session_link_accounts(selected)
+            count = db.delete_session_link_accounts(selected)
         return {"ok": True, "deleted": count}
 
     def logs(self, email: str) -> dict:

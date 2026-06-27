@@ -16,6 +16,14 @@ class BrokenProxySession:
         pass
 
 
+class LeakingProxySession:
+    def get(self, _url, timeout=None):
+        raise RuntimeError("failed via http://user:secret-password@proxy.example:8080")
+
+    def close(self):
+        pass
+
+
 class ProxyPoolSelectionTests(unittest.TestCase):
     def test_pick_random_usable_proxy_skips_unusable_proxies(self):
         checked = []
@@ -42,6 +50,18 @@ class ProxyPoolSelectionTests(unittest.TestCase):
         self.assertFalse(usable)
         self.assertNotIn("secret-password", text)
         self.assertIn("user:***@proxy.example:8080", text)
+
+    def test_proxy_check_masks_proxy_password_inside_exception_text(self):
+        proxy = "http://user:secret-password@proxy.example:8080"
+
+        with patch("webui.proxy_pool.create_http_session", return_value=LeakingProxySession()):
+            with self.assertLogs("proxy_pool", level="INFO") as logs:
+                usable = is_proxy_usable(proxy, timeout=0.01)
+
+        text = "\n".join(logs.output)
+        self.assertFalse(usable)
+        self.assertNotIn("secret-password", text)
+        self.assertIn("http://user:***@proxy.example:8080", text)
 
     def test_single_register_picks_random_usable_proxy_from_pool(self):
         pool = """
