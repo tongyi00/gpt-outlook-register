@@ -245,6 +245,124 @@ class SessionLinkControllerAccountTests(unittest.TestCase):
 
         self.with_db(run)
 
+    def test_status_reflects_running_account_batch(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                entered.set()
+                release.wait(2)
+                return self.success_result()
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                self.assertTrue(entered.wait(1))
+                try:
+                    state = controller.status()
+                    self.assertTrue(state["running"])
+                    self.assertEqual(state["status"], "running")
+                finally:
+                    release.set()
+                    self.wait_for_batch(controller)
+
+        self.with_db(run)
+
+    def test_reset_is_rejected_while_account_batch_is_running(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                entered.set()
+                release.wait(2)
+                return self.success_result()
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                self.assertTrue(entered.wait(1))
+                try:
+                    reset = controller.reset(["a@example.com"])
+                    row = db.get_session_link_account("a@example.com")
+                    self.assertFalse(reset["ok"])
+                    self.assertIn("运行", reset["error"])
+                    self.assertEqual(row["status"], "create_checkout")
+                    self.assertEqual(row["collision_count"], 1)
+                finally:
+                    release.set()
+                    self.wait_for_batch(controller)
+
+        self.with_db(run)
+
+    def test_delete_is_rejected_while_account_batch_is_running(self):
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_generate(access_token, mode, proxy_url="", target_amount="0", stage_callback=None):
+                entered.set()
+                release.wait(2)
+                return self.success_result()
+
+            with patch("webui.session_link.generate_payment_link", side_effect=fake_generate):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                self.assertTrue(entered.wait(1))
+                try:
+                    deleted = controller.delete(["a@example.com"])
+                    row = db.get_session_link_account("a@example.com")
+                    self.assertFalse(deleted["ok"])
+                    self.assertIn("运行", deleted["error"])
+                    self.assertIsNotNone(row)
+                    self.assertEqual(row["status"], "create_checkout")
+                finally:
+                    release.set()
+                    self.wait_for_batch(controller)
+
+        self.with_db(run)
+
+    def test_unhandled_account_worker_exception_marks_batch_failed(self):
+        controller = SessionLinkController()
+
+        with patch.object(controller, "_run_account_loop", side_effect=RuntimeError("worker exploded")):
+            result = controller.run_selected({
+                "emails": ["a@example.com"],
+                "payment_mode": "PayPal 长链接 US/USD",
+                "delay_seconds": 0,
+            })
+            self.assertTrue(result["ok"])
+            self.wait_for_batch(controller)
+
+        with controller._lock:
+            state = dict(controller._account_state)
+        self.assertFalse(state["running"])
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("worker exploded", state["last_error"])
+        public_state = controller.status()
+        self.assertFalse(public_state["running"])
+        self.assertEqual(public_state["status"], "failed")
+        self.assertIn("worker exploded", public_state["last_error"])
+
     def test_run_selected_marks_missing_token_account(self):
         def run():
             controller = SessionLinkController()

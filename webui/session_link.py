@@ -170,7 +170,7 @@ def _public_account(row: dict) -> dict:
 def _mask_sensitive_text(value) -> str:
     text = str(value or "")
     return re.sub(
-        r"\b((?:https?|socks5?|socks4)://[^/\s:@]+):([^@\s/]+)@",
+        r"\b((?:(?:https?|socks5?|socks4)://)?[^/\s:@]+):([^@\s/]+)@",
         r"\1:***@",
         text,
         flags=re.I,
@@ -283,6 +283,9 @@ class SessionLinkController:
             return {"ok": True, **deepcopy(self._account_state)}
 
     def reset(self, emails) -> dict:
+        with self._lock:
+            if self._account_state.get("running"):
+                return {"ok": False, "error": "账号链接任务正在运行，无法重置"}
         selected = _email_list(emails)
         count = db.reset_session_link_accounts(selected)
         for email in selected:
@@ -290,6 +293,9 @@ class SessionLinkController:
         return {"ok": True, "reset": count}
 
     def delete(self, emails) -> dict:
+        with self._lock:
+            if self._account_state.get("running"):
+                return {"ok": False, "error": "账号链接任务正在运行，无法删除"}
         selected = _email_list(emails)
         count = db.delete_session_link_accounts(selected)
         return {"ok": True, "deleted": count}
@@ -347,7 +353,27 @@ class SessionLinkController:
 
     def status(self) -> dict:
         with self._lock:
-            return {"ok": True, **deepcopy(self._state)}
+            state = deepcopy(self._state)
+            account_state = self._account_state
+            account_started = account_state.get("started_at")
+            legacy_started = state.get("started_at")
+            if account_started and (
+                account_state.get("running")
+                or not legacy_started
+                or account_started >= legacy_started
+            ):
+                state.update({
+                    "running": bool(account_state.get("running")),
+                    "status": account_state.get("status") or "running",
+                    "started_at": account_state.get("started_at"),
+                    "finished_at": account_state.get("finished_at"),
+                    "payment_mode": account_state.get("payment_mode", DEFAULT_MODE),
+                    "target_amount": account_state.get("target_amount", "0"),
+                    "delay_seconds": account_state.get("delay_seconds", 2),
+                    "total": account_state.get("total", 0),
+                    "last_error": account_state.get("last_error", ""),
+                })
+            return {"ok": True, **state}
 
     def generate_once(self, payload: dict) -> dict:
         tokens = parse_input_tokens(
@@ -401,6 +427,7 @@ class SessionLinkController:
         }
 
     def _run_account_batch(self, config: dict) -> None:
+        failed = False
         try:
             with ThreadPoolExecutor(max_workers=_env_account_workers()) as executor:
                 futures = [executor.submit(self._run_account_loop, email, config) for email in config["emails"]]
@@ -408,13 +435,19 @@ class SessionLinkController:
                     try:
                         future.result()
                     except Exception as exc:
+                        failed = True
                         with self._lock:
-                            self._account_state["last_error"] = str(exc)
+                            self._account_state["last_error"] = _mask_sensitive_text(str(exc))
         finally:
             with self._lock:
                 self._account_state["running"] = False
                 self._account_state["finished_at"] = time.time()
-                self._account_state["status"] = "stopped" if self._account_stop.is_set() else "done"
+                if self._account_stop.is_set():
+                    self._account_state["status"] = "stopped"
+                elif failed:
+                    self._account_state["status"] = "failed"
+                else:
+                    self._account_state["status"] = "done"
 
     def _run_account_loop(self, email: str, config: dict) -> None:
         while not self._account_stop.is_set():

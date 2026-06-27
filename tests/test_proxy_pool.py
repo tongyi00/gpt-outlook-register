@@ -5,7 +5,15 @@ from fastapi import HTTPException
 
 from webui import app as web_app
 from webui.auto_loop import AutoLoopController
-from webui.proxy_pool import pick_random_usable_proxy
+from webui.proxy_pool import is_proxy_usable, pick_random_usable_proxy
+
+
+class BrokenProxySession:
+    def get(self, _url, timeout=None):
+        raise RuntimeError("network failure")
+
+    def close(self):
+        pass
 
 
 class ProxyPoolSelectionTests(unittest.TestCase):
@@ -22,6 +30,18 @@ class ProxyPoolSelectionTests(unittest.TestCase):
 
         self.assertEqual(proxy, "http://proxy-good")
         self.assertEqual(checked, ["http://proxy-bad-2", "http://proxy-good"])
+
+    def test_proxy_check_logs_mask_proxy_password(self):
+        proxy = "user:secret-password@proxy.example:8080"
+
+        with patch("webui.proxy_pool.create_http_session", return_value=BrokenProxySession()):
+            with self.assertLogs("proxy_pool", level="INFO") as logs:
+                usable = is_proxy_usable(proxy, timeout=0.01)
+
+        text = "\n".join(logs.output)
+        self.assertFalse(usable)
+        self.assertNotIn("secret-password", text)
+        self.assertIn("user:***@proxy.example:8080", text)
 
     def test_single_register_picks_random_usable_proxy_from_pool(self):
         pool = """

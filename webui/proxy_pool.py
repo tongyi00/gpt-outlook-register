@@ -4,11 +4,21 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 from typing import Callable, Iterable
 
 from http_client import create_http_session
 
 logger = logging.getLogger("proxy_pool")
+
+
+def _mask_proxy_url(proxy: str) -> str:
+    return re.sub(
+        r"\b((?:(?:https?|socks5?|socks4)://)?[^/\s:@]+):([^@\s/]+)@",
+        r"\1:***@",
+        str(proxy or ""),
+        flags=re.I,
+    )
 
 
 def parse_proxy_pool(text: str) -> list[str]:
@@ -26,6 +36,7 @@ def is_proxy_usable(proxy: str, timeout: float | None = None) -> bool:
     p = str(proxy or "").strip()
     if not p:
         return False
+    safe_proxy = _mask_proxy_url(p)
     try:
         t = float(timeout if timeout is not None else os.getenv("PROXY_CHECK_TIMEOUT", "6"))
     except Exception:
@@ -36,10 +47,10 @@ def is_proxy_usable(proxy: str, timeout: float | None = None) -> bool:
         resp = session.get("https://cloudflare.com/cdn-cgi/trace", timeout=t)
         ok = getattr(resp, "status_code", 0) == 200
         if not ok:
-            logger.info("[proxy] unusable status=%s proxy=%s", getattr(resp, "status_code", "N/A"), p)
+            logger.info("[proxy] unusable status=%s proxy=%s", getattr(resp, "status_code", "N/A"), safe_proxy)
         return ok
     except Exception as e:
-        logger.info("[proxy] unusable error=%s proxy=%s", str(e)[:160], p)
+        logger.info("[proxy] unusable error=%s proxy=%s", str(e)[:160], safe_proxy)
         return False
     finally:
         try:
