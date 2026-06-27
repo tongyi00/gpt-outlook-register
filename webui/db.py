@@ -72,6 +72,20 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        CREATE TABLE IF NOT EXISTS custom_sms_accounts (
+            phone           TEXT PRIMARY KEY,
+            api_url         TEXT,
+            status          TEXT NOT NULL DEFAULT 'available',
+                            -- available / in_use / done / failed
+            success_count   INTEGER NOT NULL DEFAULT 0,
+            imported_at     REAL,
+            claimed_at      REAL,
+            finished_at     REAL,
+            fail_reason     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_custom_sms_status ON custom_sms_accounts(status);
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -80,6 +94,16 @@ def init_db():
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
         con.commit()
+
+    cur = con.execute("PRAGMA table_info(custom_sms_accounts)")
+    cols = {r[1] for r in cur.fetchall()}
+    if cols and "status" not in cols:
+        con.execute("ALTER TABLE custom_sms_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'available'")
+        con.commit()
+    if cols and "success_count" not in cols:
+        con.execute("ALTER TABLE custom_sms_accounts ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0")
+        con.commit()
+    con.close()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -351,6 +375,199 @@ def delete_accounts_by_emails(emails: list[str]) -> int:
         return rc.rowcount
 
 
+# ──────────────────────── 自定义 SMS 号池 ────────────────────────
+
+
+def parse_custom_sms_lines(text: str) -> list[dict]:
+    """解析手机号----接码API 每行格式。"""
+    out: list[dict] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("----")
+        if len(parts) != 2:
+            continue
+        phone, api_url = (p.strip() for p in parts)
+        if not phone or not api_url:
+            continue
+        out.append({"phone": phone, "api_url": api_url})
+    return out
+
+
+def import_custom_sms_accounts(text: str) -> dict:
+    """批量导入自定义手机号/API。重复手机号覆盖旧 URL 并重置为 available。"""
+    rows = parse_custom_sms_lines(text)
+    now = time.time()
+    inserted = updated = skipped = 0
+    with _lock:
+        con = _conn()
+        for r in rows:
+            cur = con.execute(
+                "SELECT api_url FROM custom_sms_accounts WHERE phone=?",
+                (r["phone"],),
+            )
+            existing = cur.fetchone()
+            if existing is None:
+                con.execute(
+                    "INSERT INTO custom_sms_accounts(phone, api_url, status, success_count, imported_at) "
+                    "VALUES (?, ?, 'available', 0, ?)",
+                    (r["phone"], r["api_url"], now),
+                )
+                inserted += 1
+            elif (existing["api_url"] or "") != r["api_url"]:
+                con.execute(
+                    "UPDATE custom_sms_accounts SET api_url=?, status='available', "
+                    "imported_at=?, claimed_at=NULL, finished_at=NULL, fail_reason=NULL "
+                    "WHERE phone=?",
+                    (r["api_url"], now, r["phone"]),
+                )
+                updated += 1
+            else:
+                skipped += 1
+        con.commit()
+    return {"parsed": len(rows), "inserted": inserted, "updated": updated, "skipped": skipped}
+
+
+def get_custom_sms_account(phone: str) -> Optional[dict]:
+    con = _conn()
+    cur = con.execute("SELECT * FROM custom_sms_accounts WHERE phone=?", (str(phone or "").strip(),))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_custom_sms_accounts(status: str = "", limit: int = 500) -> list[dict]:
+    valid_status = {"available", "in_use", "done", "failed"}
+    s = str(status or "").strip().lower()
+    if s not in valid_status:
+        s = ""
+    try:
+        n = int(limit)
+    except Exception:
+        n = 500
+    n = max(1, min(n, 5000))
+
+    con = _conn()
+    if s:
+        cur = con.execute(
+            "SELECT * FROM custom_sms_accounts WHERE status=? "
+            "ORDER BY imported_at DESC LIMIT ?",
+            (s, n),
+        )
+    else:
+        cur = con.execute(
+            "SELECT * FROM custom_sms_accounts ORDER BY imported_at DESC LIMIT ?",
+            (n,),
+        )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def claim_custom_sms_phone() -> Optional[dict]:
+    """原子 claim 一个可用的自定义手机号。"""
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            "SELECT * FROM custom_sms_accounts WHERE status='available' "
+            "ORDER BY imported_at ASC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        rc = con.execute(
+            "UPDATE custom_sms_accounts SET status='in_use', claimed_at=? "
+            "WHERE phone=? AND status='available'",
+            (time.time(), row["phone"]),
+        )
+        con.commit()
+        if rc.rowcount != 1:
+            return claim_custom_sms_phone()
+        return dict(row)
+
+
+def mark_custom_sms_done(phone: str) -> None:
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE custom_sms_accounts SET status='done', finished_at=?, fail_reason=NULL, "
+            "success_count=COALESCE(success_count, 0)+1 WHERE phone=?",
+            (time.time(), str(phone or "").strip()),
+        )
+        con.commit()
+
+
+def mark_custom_sms_failed(phone: str, reason: str = "") -> None:
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE custom_sms_accounts SET status='failed', finished_at=?, fail_reason=? WHERE phone=?",
+            (time.time(), (reason or "")[:500], str(phone or "").strip()),
+        )
+        con.commit()
+
+
+def release_custom_sms_unused(phone: str) -> None:
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE custom_sms_accounts SET status='available', claimed_at=NULL "
+            "WHERE phone=? AND status='in_use'",
+            (str(phone or "").strip(),),
+        )
+        con.commit()
+
+
+def reset_custom_sms_to_available(phone: str) -> bool:
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE custom_sms_accounts SET status='available', claimed_at=NULL, "
+            "finished_at=NULL, fail_reason=NULL WHERE phone=?",
+            (str(phone or "").strip(),),
+        )
+        con.commit()
+        return rc.rowcount > 0
+
+
+def reset_failed_custom_sms_to_available() -> int:
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE custom_sms_accounts SET status='available', fail_reason=NULL, "
+            "finished_at=NULL WHERE status='failed'"
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def reset_all_custom_sms_to_available() -> int:
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "UPDATE custom_sms_accounts SET status='available', claimed_at=NULL, "
+            "finished_at=NULL, fail_reason=NULL"
+        )
+        con.commit()
+        return rc.rowcount
+
+
+def delete_custom_sms_account(phone: str) -> bool:
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            "DELETE FROM custom_sms_accounts WHERE phone=?",
+            (str(phone or "").strip(),),
+        )
+        con.commit()
+        return rc.rowcount > 0
+
+
+def count_custom_sms_accounts() -> int:
+    con = _conn()
+    cur = con.execute("SELECT COUNT(*) AS n FROM custom_sms_accounts")
+    row = cur.fetchone()
+    return int(row["n"]) if row else 0
+
+
 def stats() -> dict:
     con = _conn()
     cur = con.execute(
@@ -543,8 +760,9 @@ def get_mail_config() -> dict:
     return {
         "mail_source":   get_setting("mail_source", "outlook"),  # outlook / cf_temp
         "cf_api_url":    get_setting("cf_api_url", ""),
-        "cf_admin_token": "***" if get_setting("cf_admin_token") else "",
+        "cf_admin_token": get_setting("cf_admin_token", ""),
         "cf_domain":     get_setting("cf_domain", ""),
+        "cf_enable_prefix": get_setting("cf_enable_prefix", "1"),
     }
 
 
@@ -559,6 +777,9 @@ def save_mail_config(data: dict) -> None:
         set_setting("cf_api_url", str(data["cf_api_url"]).strip())
     if "cf_domain" in data:
         set_setting("cf_domain", str(data["cf_domain"]).strip())
+    if "cf_enable_prefix" in data:
+        val = str(data["cf_enable_prefix"]).strip().lower()
+        set_setting("cf_enable_prefix", "0" if val in ("0", "false", "no", "off") else "1")
     if data.get("cf_admin_token") and data["cf_admin_token"] != "***":
         set_setting("cf_admin_token", str(data["cf_admin_token"]).strip())
 
@@ -575,7 +796,7 @@ def get_sms_config() -> dict:
     """返回 SMS 接码配置（api_key 隐藏明文）。
 
     sms_enabled:        '0'/'1' 是否启用接码（命中 add-phone 时才会用）
-    sms_provider:       smsbower
+    sms_provider:       custom
     sms_country:        国家代码或 ID（推荐 '52' = Thailand，OpenAI 走 SMS 的唯一稳定国家）
     sms_service:        服务代码（OpenAI = 'dr'）
     sms_max_price:      号码最高单价（SmsBower / SmsBower 用，单位平台货币；空 / -1 = 不限）
@@ -586,8 +807,8 @@ def get_sms_config() -> dict:
     sms_auto_max_price: 自动选国家最高单价（默认 0 = 不限）
     """
     return {
-        "sms_enabled":             get_setting("sms_enabled", "0"),
-        "sms_provider":            get_setting("sms_provider", "smsbower"),
+        "sms_enabled":             get_setting("sms_enabled", "1"),
+        "sms_provider":            get_setting("sms_provider", "custom"),
         "sms_api_key":             "***" if get_setting("sms_api_key") else "",
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
@@ -601,17 +822,18 @@ def get_sms_config() -> dict:
         "sms_auto_max_price":      get_setting("sms_auto_max_price", ""),
         "sms_max_phone_attempts":  get_setting("sms_max_phone_attempts", ""),
         "sms_per_phone_timeout":   get_setting("sms_per_phone_timeout", "80"),
+        "sms_custom_regex":        get_setting("sms_custom_regex", r"(?<!\d)\d{6}(?!\d)"),
     }
 
 
 def save_sms_config(data: dict) -> None:
     """保存 SMS 配置。sms_api_key 传 '***' 表示不修改。"""
     # 校验 provider
-    valid_providers = {"smsbower"}
+    valid_providers = {"smsbower", "custom"}
     if "sms_provider" in data:
         p = str(data["sms_provider"]).strip().lower()
         if p not in valid_providers:
-            p = "smsbower"
+            p = "custom"
         set_setting("sms_provider", p)
     # 字符串字段直接落
     for key in (
@@ -619,6 +841,7 @@ def save_sms_config(data: dict) -> None:
         "sms_phone_success_max", "sms_auto_min_stock", "sms_auto_max_price",
         "sms_max_phone_attempts", "sms_per_phone_timeout",
         "sms_allowed_countries",
+        "sms_custom_regex",
     ):
         if key in data:
             set_setting(key, str(data[key]).strip())
@@ -639,8 +862,8 @@ def save_sms_config(data: dict) -> None:
 def get_sms_internal_config() -> dict:
     """内部用：拿明文 sms_api_key,供 sms_provider 实例化使用。"""
     return {
-        "sms_enabled":             get_setting("sms_enabled", "0") in ("1", "true"),
-        "sms_provider":            get_setting("sms_provider", "smsbower"),
+        "sms_enabled":             get_setting("sms_enabled", "1") in ("1", "true"),
+        "sms_provider":            get_setting("sms_provider", "custom"),
         "sms_api_key":             get_setting("sms_api_key", ""),
         "sms_country":             get_setting("sms_country", "52"),
         "sms_service":             get_setting("sms_service", "dr"),
@@ -654,6 +877,7 @@ def get_sms_internal_config() -> dict:
         "sms_auto_max_price":      get_setting("sms_auto_max_price", ""),
         "sms_max_phone_attempts":  get_setting("sms_max_phone_attempts", ""),
         "sms_per_phone_timeout":   get_setting("sms_per_phone_timeout", "80"),
+        "sms_custom_regex":        get_setting("sms_custom_regex", r"(?<!\d)\d{6}(?!\d)"),
     }
 
 

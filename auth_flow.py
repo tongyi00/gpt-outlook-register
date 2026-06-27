@@ -61,7 +61,12 @@ class AuthResult:
 class AuthFlow:
     """注册/登录协议流"""
 
-    def __init__(self, config: Config, sms_callback: Optional[Any] = None):
+    def __init__(
+        self,
+        config: Config,
+        sms_callback: Optional[Any] = None,
+        cancel_event: Optional[Any] = None,
+    ):
         self.config = config
         self._impersonate_candidates = ["chrome136", "chrome124", "chrome120"]
         self._impersonate_idx = 0
@@ -91,6 +96,7 @@ class AuthFlow:
         self._client_auth_session_id: str = ""
         self._dump_login_verifier: str = ""
         self._codex_rt_attempted: bool = False
+        self._cancel_event = cancel_event
         self._trace_dump_enabled = str(os.getenv("AUTH_TRACE_DUMP", "0")).lower() in ("1", "true", "yes", "on")
         self._trace_include_cookie = str(os.getenv("AUTH_TRACE_INCLUDE_COOKIE", "0")).lower() in (
             "1", "true", "yes", "on"
@@ -445,6 +451,11 @@ class AuthFlow:
             "有" if self.result.refresh_token else "无",
             "有" if self._dump_login_verifier else "无",
         )
+        logger.info(
+            "auth_context(%s): %s",
+            stage or "default",
+            self._auth_context_summary(),
+        )
         return data
 
     @staticmethod
@@ -457,6 +468,108 @@ class AuthFlow:
     def _is_registration_disallowed_error(exc: Exception) -> bool:
         msg = str(exc).lower()
         return "registration_disallowed" in msg
+
+    @staticmethod
+    def _safe_url_for_log(url: str) -> str:
+        if not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+            if not parsed.scheme or not parsed.netloc:
+                return url[:160]
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"[:160]
+        except Exception:
+            return str(url)[:160]
+
+    def _cookie_presence_summary(self, names: list[str] | None = None) -> str:
+        names = names or [
+            "oai-client-auth-session",
+            "auth_session",
+            "login_session",
+            "__Secure-next-auth.session-token",
+            "oai-did",
+        ]
+        wanted = {n.lower(): n for n in names}
+        found: dict[str, list[tuple[int, str]]] = {n: [] for n in names}
+
+        try:
+            jar = getattr(self.session.cookies, "jar", None)
+        except Exception:
+            jar = None
+
+        if jar is not None:
+            try:
+                for c in jar:
+                    cname = (getattr(c, "name", "") or "").strip()
+                    canonical = wanted.get(cname.lower())
+                    if not canonical:
+                        continue
+                    value = (getattr(c, "value", "") or "")
+                    domain = (getattr(c, "domain", "") or "").strip() or "-"
+                    found[canonical].append((len(value), domain))
+            except Exception:
+                pass
+
+        for cname in names:
+            if found[cname]:
+                continue
+            try:
+                value = self.session.cookies.get(cname, "")
+            except Exception:
+                value = ""
+            if value:
+                found[cname].append((len(str(value)), "-"))
+
+        parts = []
+        for cname in names:
+            entries = found.get(cname) or []
+            if not entries:
+                parts.append(f"{cname}=N")
+                continue
+            lengths = "/".join(str(length) for length, _domain in entries[:3])
+            domains = []
+            for _length, domain in entries:
+                if domain not in domains:
+                    domains.append(domain)
+            parts.append(
+                f"{cname}=Y(len={lengths},domains={','.join(domains[:3])})"
+            )
+        return "; ".join(parts)
+
+    def _auth_context_summary(self) -> str:
+        cas = (
+            self._client_auth_session_dump.get("client_auth_session", {})
+            if isinstance(self._client_auth_session_dump, dict)
+            else {}
+        )
+        if not isinstance(cas, dict):
+            cas = {}
+        session_id = (
+            self._client_auth_session_id
+            or (cas.get("session_id", "") or "")
+            or (
+                self._client_auth_session_dump.get("session_id", "")
+                if isinstance(self._client_auth_session_dump, dict)
+                else ""
+            )
+        )
+        fields = [
+            f"is_existing={bool(self._is_existing_account)}",
+            f"page_type={(self._existing_page_type or '')[:80]}",
+            f"mode={(self._existing_email_verification_mode or '')[:80]}",
+            f"email={(cas.get('email', '') or cas.get('username', '') or '')[:120]}",
+            f"signup_source={(cas.get('signup_source', '') or '')[:80]}",
+            f"signup_mode={(cas.get('signup_mode', '') or '')[:80]}",
+            f"email_verified={cas.get('email_verified', '')}",
+            f"email_verification_mode={(cas.get('email_verification_mode', '') or '')[:80]}",
+            f"original_screen_hint={(cas.get('original_screen_hint', '') or '')[:80]}",
+            f"country_code_hint={(cas.get('country_code_hint', '') or '')[:20]}",
+            f"passwordless_disabled={cas.get('passwordless_disabled', '')}",
+            f"passwordless_redirect={cas.get('passwordless_otp_from_password_redirect', '')}",
+            f"session_id_len={len(str(session_id or ''))}",
+            f"cookies=[{self._cookie_presence_summary()}]",
+        ]
+        return " ".join(fields)
 
     def _get_cookie_value_by_name(self, name: str) -> str:
         """按 cookie 名称获取值（忽略 domain 冲突）。"""
@@ -536,6 +649,13 @@ class AuthFlow:
     @staticmethod
     def _env_flag(name: str, default: str = "0") -> bool:
         return str(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
+
+    def _check_cancelled(self) -> None:
+        try:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                raise RuntimeError("registration_cancelled: 用户停止当前注册")
+        except AttributeError:
+            return
 
     @staticmethod
     def _b64url_no_pad(raw: bytes) -> str:
@@ -832,13 +952,119 @@ class AuthFlow:
             headers["oai-device-id"] = device_id
         return headers
 
+    @staticmethod
+    def _compact_for_log(value: Any, limit: int = 1200) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                text = str(value)
+        else:
+            text = str(value)
+        text = text.replace("\r", "\\r").replace("\n", "\\n")
+        if len(text) > limit:
+            return text[:limit] + "...(truncated)"
+        return text
+
+    @staticmethod
+    def _response_header(resp, name: str) -> str:
+        try:
+            headers = getattr(resp, "headers", {}) or {}
+            value = headers.get(name, "") or ""
+            if not value:
+                target = (name or "").lower()
+                for key, maybe_value in dict(headers).items():
+                    if str(key).lower() == target:
+                        value = maybe_value
+                        break
+            return str(value or "")[:160]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_phone_for_add_phone(phone_number: str) -> str:
+        raw = str(phone_number or "").strip()
+        if not raw:
+            return ""
+        digits = re.sub(r"\D", "", raw)
+        if not digits:
+            return raw
+        if raw.startswith("+"):
+            return f"+{digits}"
+        if digits.startswith("00") and len(digits) > 2:
+            return f"+{digits[2:]}"
+        return f"+{digits}"
+
+    def _add_phone_send_error_message(self, phone_number: str, resp, payload: dict) -> str:
+        parsed: Any = None
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+
+        error = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
+
+        body = ""
+        try:
+            body = getattr(resp, "text", "") or ""
+        except Exception:
+            body = ""
+        if not body and parsed is not None:
+            body = self._compact_for_log(parsed)
+
+        phone_raw = str(phone_number or "").strip()
+        sent_phone = str((payload or {}).get("phone_number") or "").strip()
+        phone_digits = re.sub(r"\D", "", sent_phone or phone_raw)
+        sent_e164_like = sent_phone.startswith("+") and 8 <= len(phone_digits) <= 15
+        if sent_e164_like and phone_raw == sent_phone:
+            format_hint = "ok"
+        elif sent_e164_like:
+            format_hint = "normalized_with_plus"
+        elif not sent_phone.startswith("+"):
+            format_hint = "missing_plus_or_country_code"
+        else:
+            format_hint = "invalid_digit_length_or_format"
+        diagnostics = [
+            "add-phone/send failed:",
+            f"http={getattr(resp, 'status_code', 'N/A')}",
+            f"req_id={self._response_header(resp, 'x-request-id') or '-'}",
+            f"cf_ray={self._response_header(resp, 'cf-ray') or '-'}",
+            f"content_type={self._response_header(resp, 'Content-Type') or '-'}",
+            f"error_message={self._compact_for_log(error.get('message', '')) or '-'}",
+            f"error_type={self._compact_for_log(error.get('type', '')) or '-'}",
+            f"error_code={self._compact_for_log(error.get('code', '')) or '-'}",
+            f"error_param={self._compact_for_log(error.get('param', '')) or '-'}",
+            f"phone={phone_raw}",
+            f"sent_phone={sent_phone}",
+            f"has_plus={1 if phone_raw.startswith('+') else 0}",
+            f"digits_len={len(phone_digits)}",
+            f"e164_like={1 if sent_e164_like else 0}",
+            f"format_hint={format_hint}",
+            f"payload={payload!r}",
+        ]
+
+        for key in ("detail", "errors", "page_type", "continue_url"):
+            if isinstance(parsed, dict) and key in parsed:
+                diagnostics.append(f"{key}={self._compact_for_log(parsed.get(key), 500) or '-'}")
+
+        diagnostics.append(f"body={self._compact_for_log(body, 1500)}")
+        return " ".join(diagnostics)
+
     def _add_phone_send(self, phone_number: str) -> dict:
         headers = self._phone_headers("https://auth.openai.com/add-phone")
+        sent_phone = self._normalize_phone_for_add_phone(phone_number)
+        payload = {"phone_number": sent_phone, "channel": "sms"}
+        if sent_phone != str(phone_number or "").strip():
+            logger.info("[add-phone] normalized phone for send: raw=%s sent=%s", phone_number, sent_phone)
         try:
             resp = self.session.post(
                 "https://auth.openai.com/api/accounts/add-phone/send",
                 headers=headers,
-                json={"phone_number": phone_number},
+                json=payload,
                 timeout=30,
             )
         except Exception as e:
@@ -847,16 +1073,9 @@ class AuthFlow:
         self._trace_http("add_phone_send", resp)
 
         if resp.status_code != 200:
-            # 解析 error.message（如果有的话）
-            try:
-                data = resp.json()
-                msg = data.get("error", {}).get("message", "")
-                code = data.get("error", {}).get("code", "")
-            except Exception:
-                msg = resp.text[:150]
-                code = ""
-            # 抛异常时只带 message（不带完整 JSON），让上层日志更简洁
-            raise RuntimeError(msg or f"HTTP {resp.status_code}")
+            detail = self._add_phone_send_error_message(phone_number, resp, payload)
+            logger.warning("[add-phone] send failed diagnostics: %s", detail)
+            raise RuntimeError(detail)
 
         try:
             return resp.json() if resp is not None else {}
@@ -1051,12 +1270,20 @@ class AuthFlow:
                     logger.warning("[sms] 号 %s 被 OpenAI 拒（已用过/不允许）: %s",
                                    phone, err_text[:200])
                     ctrl.mark_send_failed(err_text)
+                    try:
+                        ctrl.cleanup()
+                    except Exception:
+                        pass
                     last_err = e
                     continue
                 # 其它未识别错误 → 也打详细日志但不视为"号码问题"
                 logger.warning("[sms] 号 %s POST add-phone/send 失败（未识别错误）: %s",
                                phone, err_text[:300])
                 ctrl.mark_send_failed(err_text)
+                try:
+                    ctrl.cleanup()
+                except Exception:
+                    pass
                 last_err = e
                 continue
 
@@ -1070,6 +1297,10 @@ class AuthFlow:
                     (send_continue or "")[:180],
                 )
                 ctrl.mark_send_failed("did not enter phone-verification page")
+                try:
+                    ctrl.cleanup()
+                except Exception:
+                    pass
                 last_err = RuntimeError(f"add-phone/send 未进入 phone-verification: page={send_page_type}")
                 continue
 
@@ -1632,8 +1863,20 @@ class AuthFlow:
     # ── Step 5: 获取 Sentinel Token ──
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
-        from sentinel import get_sentinel_token
-        token = get_sentinel_token(self.session, device_id=device_id, flow="authorize_continue")
+        from sentinel import get_sentinel_token, is_valid_sentinel_token
+        token = ""
+        for attempt in range(3):
+            token = get_sentinel_token(self.session, device_id=device_id, flow="authorize_continue")
+            if is_valid_sentinel_token(token):
+                break
+            if attempt < 2:
+                logger.warning("Sentinel token 无有效 challenge，重试获取 (%s/3)", attempt + 1)
+                time.sleep(2 * (attempt + 1))
+        else:
+            raise RuntimeError(
+                "Sentinel challenge 获取失败：本轮 token 无服务端 challenge，继续注册会导致 OTP 静默不投递。"
+                "请重试或切换到能稳定访问 sentinel.openai.com 的代理/网络。"
+            )
         self._last_sentinel_token = token or ""
         logger.info("Sentinel Token 获取成功")
         return token
@@ -1698,6 +1941,13 @@ class AuthFlow:
             page_type = (page.get("type") or "").strip()
             payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
             continue_url = (data.get("continue_url") or "").strip()
+            mode_hint = (payload.get("email_verification_mode", "") or "").strip()
+            logger.info(
+                "authorize_continue_signup result: page_type=%s mode=%s continue_url=%s",
+                page_type or "(empty)",
+                mode_hint or "(empty)",
+                self._safe_url_for_log(continue_url) or "(empty)",
+            )
 
             # 新账号标准分支
             if page_type == "create_account_password" or "/create-account/password" in continue_url:
@@ -1709,14 +1959,14 @@ class AuthFlow:
 
             # 已有账号 OTP 分支
             if page_type == "email_otp_verification":
-                self._existing_email_verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+                self._existing_email_verification_mode = mode_hint
                 self._existing_page_type = page_type
                 logger.info("检测到已有账号，切换到 OTP 登录流程")
                 self._is_existing_account = True
                 return False
 
             # 未知 page_type：通常是社交登录/风控分支，按已有账号处理，避免误进 register_password 导致 invalid_state
-            self._existing_email_verification_mode = (payload.get("email_verification_mode", "") or "").strip()
+            self._existing_email_verification_mode = mode_hint
             self._existing_page_type = page_type
             self._is_existing_account = True
             logger.warning(
@@ -1936,6 +2186,7 @@ class AuthFlow:
     # ── Step 9: 创建账户 ──
     def create_account(self) -> str:
         logger.info("[8/10] 创建账户...")
+        logger.info("create_account context(before): %s", self._auth_context_summary())
         # 创建账户前刷新 sentinel token，flow 为 create_account
         if self.result.device_id:
             try:
@@ -1950,6 +2201,28 @@ class AuthFlow:
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
+        try:
+            about_resp = self.session.get(
+                "https://auth.openai.com/about-you",
+                headers=self._common_headers("https://auth.openai.com/email-verification"),
+                timeout=20,
+                allow_redirects=False,
+            )
+            self._trace_http("about_you_preflight", about_resp)
+            logger.info(
+                "about-you preflight: status=%s location=%s url=%s auth_session_cookie=%s client_auth_cookie=%s",
+                getattr(about_resp, "status_code", "N/A"),
+                (about_resp.headers.get("Location", "") or "")[:160],
+                str(getattr(about_resp, "url", "") or "")[:160],
+                "有" if self._get_cookie_value_by_name("auth_session") else "无",
+                "有" if self._get_cookie_value_by_name("oai-client-auth-session") else "无",
+            )
+            logger.info(
+                "create_account context(after_about_you_preflight): %s",
+                self._auth_context_summary(),
+            )
+        except Exception as e:
+            logger.warning("about-you preflight 异常: %s", e)
         _FIRST = ["James", "John", "Robert", "Michael", "William", "David", "Richard",
                   "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda",
                   "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen"]
@@ -1957,18 +2230,37 @@ class AuthFlow:
                  "Davis", "Rodriguez", "Martinez", "Wilson", "Anderson", "Taylor", "Thomas"]
         name = f"{random.choice(_FIRST)} {random.choice(_LAST)}"
         birthdate = f"{random.randint(1985, 2000)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
+        create_payload = {"name": name, "birthdate": birthdate}
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/create_account",
             headers=headers,
-            json={"name": name, "birthdate": birthdate},
+            json=create_payload,
             timeout=30,
         )
         self._trace_http("create_account", resp)
         if resp.status_code != 200:
             body = (resp.text or "")[:500]
+            try:
+                logger.error(
+                    "create_account diagnostics: req_id=%s cf_ray=%s payload=%s "
+                    "context=%s",
+                    (resp.headers.get("x-request-id", "") or "")[:120],
+                    (resp.headers.get("cf-ray", "") or "")[:120],
+                    create_payload,
+                    self._auth_context_summary(),
+                )
+            except Exception as diag_e:
+                logger.debug("create_account diagnostics failed: %s", diag_e)
             logger.error("创建账户失败: http=%s body=%s", resp.status_code, body)
             raise RuntimeError(f"创建账户失败: {resp.status_code} - {body[:260]}")
         data = resp.json()
+        logger.info(
+            "create_account success diagnostics: req_id=%s cf_ray=%s payload=%s context=%s",
+            (resp.headers.get("x-request-id", "") or "")[:120],
+            (resp.headers.get("cf-ray", "") or "")[:120],
+            create_payload,
+            self._auth_context_summary(),
+        )
         continue_url = data.get("continue_url", "")
         self._sniff_login_verifier(continue_url, "create_account_continue_url")
 
@@ -2579,19 +2871,27 @@ class AuthFlow:
     def run_register(self, mail_provider: MailProvider) -> AuthResult:
         """执行完整注册流程"""
         # 检查网络
+        self._check_cancelled()
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
 
         # 创建邮箱
+        self._check_cancelled()
         email = mail_provider.create_mailbox()
         self.result.email = email
 
         # 登录/注册链路
+        self._check_cancelled()
         csrf_token = self.get_csrf_token()
+        self._check_cancelled()
         auth_url = self.get_auth_url(csrf_token)
+        self._check_cancelled()
         device_id = self.auth_oauth_init(auth_url)
+        self._check_cancelled()
         sentinel = self.get_sentinel_token(device_id)
+        self._check_cancelled()
         is_new = self.signup(email, sentinel)
+        self._check_cancelled()
 
         # outlook 接码池邮箱被 OpenAI 标"已有账号" 处理策略:
         #   WEBUI_ALLOW_LOGIN=1 (promo-link 等需要拿 access_token 的模式) → 走 OTP login 拿凭证
@@ -2624,10 +2924,12 @@ class AuthFlow:
 
         if is_new:
             # 新账号：注册密码 → 发 OTP → 验证 → 创建账户
+            self._check_cancelled()
             password_registered = self.register_password(email)
             otp_sent_at = time.time()
             if password_registered:
                 try:
+                    self._check_cancelled()
                     self.send_otp()
                 except RuntimeError as e:
                     # 部分账号会在 register 后直接转入 email-verification，send 接口会报 invalid_auth_step
@@ -2653,8 +2955,10 @@ class AuthFlow:
                 timeout=otp_timeout,
                 issued_after=otp_sent_at,
             )
+            self._check_cancelled()
             try:
                 self.verify_otp(otp_code)
+                self._check_cancelled()
                 self.fetch_client_auth_session_dump("post_verify_otp_new")
             except RuntimeError as e:
                 # 偶发 401 错码，补发一次 OTP 并重试
@@ -2668,12 +2972,15 @@ class AuthFlow:
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._check_cancelled()
                     self.verify_otp(otp_code)
+                    self._check_cancelled()
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_new")
                 else:
                     raise
 
             try:
+                self._check_cancelled()
                 continue_url = self.create_account()
             except Exception as e:
                 # registration_disallowed 时尝试 reauthorize 兜底，若仍不可用再抛出
@@ -2702,6 +3009,7 @@ class AuthFlow:
                     login_password = self._default_password_from_email(email)
                 self.result.password = login_password
                 login_resp = self.login_password_verify(login_password)
+                self._check_cancelled()
                 continue_url = self._normalize_continue_url(
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
                 )
@@ -2716,6 +3024,7 @@ class AuthFlow:
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._check_cancelled()
                     otp_resp = self.verify_otp(otp_code)
                     continue_url = self._normalize_continue_url(
                         (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
@@ -2729,8 +3038,8 @@ class AuthFlow:
                     # 某些模式在 /authorize/continue 已触发发码，不要重复 /email-otp/send 以免破坏 state
                     # 默认先尝试 /email-otp/resend 获取新码，失败再回看短窗口
                     forced_resend = self._env_flag("OTP_FORCE_RESEND", "1")
+                    otp_sent_at = time.time()
                     if forced_resend and self.kickoff_otp_delivery("existing_forced_resend"):
-                        otp_sent_at = time.time()
                         logger.info(f"已有账号验证码模式={mode}，已主动 resend OTP")
                     else:
                         # 回看短窗口，避免误读上一轮旧验证码
@@ -2743,6 +3052,7 @@ class AuthFlow:
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
+                    self._check_cancelled()
                 except TimeoutError:
                     # mail/provider IMAP-only 纯协议失败时已设 outlook_exhausted=True 并 mark_dead，
                     # 不 retry 直接 raise，避免再次等待无效收件链路。
@@ -2760,6 +3070,7 @@ class AuthFlow:
                             timeout=otp_timeout,
                             issued_after=otp_sent_at,
                         )
+                        self._check_cancelled()
                     except TimeoutError:
                         # outlook 池 + "已有账号" 分支 + 两次 timeout = OpenAI 反欺诈
                         # 静默拒绝（页面声称已注册但不真发邮件）→ mark dead 该 outlook
@@ -2775,6 +3086,7 @@ class AuthFlow:
                         raise
                 try:
                     otp_resp = self.verify_otp(otp_code)
+                    self._check_cancelled()
                     self.fetch_client_auth_session_dump("post_verify_otp_existing")
                 except RuntimeError as e:
                     if any(code in str(e) for code in ("401", "409")):
@@ -2787,7 +3099,9 @@ class AuthFlow:
                             timeout=otp_timeout,
                             issued_after=otp_sent_at,
                         )
+                        self._check_cancelled()
                         otp_resp = self.verify_otp(otp_code)
+                        self._check_cancelled()
                         self.fetch_client_auth_session_dump("post_verify_otp_retry_existing")
                     else:
                         raise
@@ -2800,21 +3114,31 @@ class AuthFlow:
 
             # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
             if continue_url and "/about-you" in continue_url:
-                try:
-                    continue_url = self.create_account()
-                except Exception as e:
-                    if self._is_registration_disallowed_error(e):
-                        logger.warning("about-you create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
-                        continue_url = self._reauthorize_for_session(auth_url) or ""
-                        if continue_url:
-                            logger.info("reauthorize 兜底成功，继续后续 session 获取")
-                            # 下游会走 follow_redirect_chain + get_auth_session
-                            pass
+                if getattr(mail_provider, "is_cf_temp", False) and self._env_flag(
+                    "CF_TEMP_REAUTHORIZE_INSTEAD_OF_CREATE", "0"
+                ):
+                    logger.warning(
+                        "[cf_temp] OTP 后进入 about-you，按 Outlook 兼容登录路径跳过 create_account，"
+                        "直接 reauthorize 获取 session"
+                    )
+                    continue_url = self._reauthorize_for_session(auth_url) or ""
+                else:
+                    try:
+                        self._check_cancelled()
+                        continue_url = self.create_account()
+                    except Exception as e:
+                        if self._is_registration_disallowed_error(e):
+                            logger.warning("about-you create_account 被拒绝，尝试 reauthorize 兜底获取 session ...")
+                            continue_url = self._reauthorize_for_session(auth_url) or ""
+                            if continue_url:
+                                logger.info("reauthorize 兜底成功，继续后续 session 获取")
+                                # 下游会走 follow_redirect_chain + get_auth_session
+                                pass
+                            else:
+                                raise
                         else:
-                            raise
-                    else:
-                        logger.warning(f"已有账号 about-you 创建信息失败，回退 reauthorize: {e}")
-                        continue_url = ""
+                            logger.warning(f"已有账号 about-you 创建信息失败，回退 reauthorize: {e}")
+                            continue_url = ""
 
             # 若 otp 响应未给可用 continue_url，则回退到 reauthorize
             if not continue_url:
@@ -2825,13 +3149,16 @@ class AuthFlow:
             continue_url = self._normalize_continue_url(continue_url)
             # 关键尝试：在 chatgpt callback 被消费前，先走一次 Codex OAuth（有助于保留 auth.openai 登录态）
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+                self._check_cancelled()
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             # 可选：在 callback 被消费前尝试 token 交换（可能影响后续 callback，默认关闭）
             refresh_only_mode = self._env_flag("OAUTH_REFRESH_ONLY", "0")
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
             if pre_exchange and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self._check_cancelled()
                 self.oauth_token_exchange(continue_url, continue_url)
+            self._check_cancelled()
             callback_url, final_url = self.follow_redirect_chain(continue_url)
             if (not callback_url) and final_url and ("/workspace" in final_url):
                 normalized = self._normalize_continue_url(final_url)
@@ -2852,26 +3179,33 @@ class AuthFlow:
         #       Codex RT exchange 用独立 authorize 链路，跟 chatgpt callback 不冲突。
         if (not refresh_only_mode) and callback_url:
             logger.info("消费 callback 触发 NextAuth Set-Cookie (session-token) ...")
+            self._check_cancelled()
             self._consume_callback_for_session(callback_url)
 
         if not refresh_only_mode:
+            self._check_cancelled()
             self.get_auth_session()
 
         # Codex OAuth refresh_token 交换（独立 authorize 链路，不依赖上面 callback 的 code）
         if callback_url or continue_url:
+            self._check_cancelled()
             self.fetch_client_auth_session_dump("pre_oauth_exchange_register")
             # 注意：oauth_token_exchange(callback_url) 会和 NextAuth 抢同一个 code，
             # 默认禁用避免冲突；只有用户显式 SET OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK=1
             # 才尝试（极少需要，access_token 已通过 NextAuth callback 拿到）。
             if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
                     and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
+                self._check_cancelled()
                 self.oauth_token_exchange(callback_url or "", continue_url or "")
             if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+                self._check_cancelled()
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
+                self._check_cancelled()
                 self.oauth_secondary_authorize_exchange()
             # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
             if not refresh_only_mode:
+                self._check_cancelled()
                 self.get_auth_session()
 
         if refresh_only_mode:
@@ -2998,8 +3332,8 @@ class AuthFlow:
             otp_sent_at = time.time()
             resend_ok = self.kickoff_otp_delivery("protocol_need_otp")
             if not resend_ok and mode not in ("passwordless_signup", "passwordless_login"):
-                self.send_otp()
                 otp_sent_at = time.time()
+                self.send_otp()
 
             otp_code = mail_provider.wait_for_otp(
                 email,

@@ -1,0 +1,939 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Outlook Register · 控制台</title>
+<!--
+  高保真设计稿 — 风格 E（柔彩活力：浅米 + 薄荷绿 + 珊瑚橙）
+  布局：左侧导航（注册 / 数据 / 配置）+ 主内容区。日志 = 全局悬浮窗（拖拽/缩放/最小化）。
+  导航结构：
+    注册 → ChatGPT（单个注册 + 自动跑号池，同一页两块）
+    数据 → 号池 / 运行结果（运行结果页内左右分栏：左 注册结果 · 右 运行记录）
+    配置 → 邮箱来源 / SMS 接码 / 自动导出
+  数据为假数据，用于看视觉方向，不接后端。
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ══════════════════════════════════════════════════════════════
+   风格 E · 柔彩活力 —— 唯一主题，token 化便于后续接入真实页面
+   ══════════════════════════════════════════════════════════════ */
+:root {
+  --font-ui: "Manrope", -apple-system, "PingFang SC", sans-serif;
+  --font-display: "Space Grotesk", "Manrope", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --bg: #fbfaf6;
+  --surface: #ffffff;
+  --surface-2: #f5f6f1;
+  --surface-hover: #eef2ec;
+  --nav-bg: #f3f5ee;
+  --nav-active: #e0f3ea;
+  --nav-active-text: #0f9d6b;
+
+  --text: #20302b;
+  --text-2: #51635c;
+  --muted: #9aa8a0;
+  --border: #e8ebe2;
+  --border-strong: #cdd6c9;
+
+  --accent: #12b886;
+  --accent-hover: #0e9a72;
+  --accent-soft: #ddf5ec;
+  --on-accent: #ffffff;
+  --accent-2: #ff7a59;
+  --accent-2-soft: #ffe9e2;
+
+  --ok: #12b886;   --ok-soft: #ddf5ec;
+  --warn: #f08c2e; --warn-soft: #fdeedd;
+  --bad: #f0556a;  --bad-soft: #fde1e5;
+  --info: #3d8bf0; --info-soft: #e2eefd;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --radius-lg: 20px;
+  --shadow-card: 0 2px 8px rgba(32,48,43,.05), 0 1px 2px rgba(32,48,43,.04);
+  --shadow-float: 0 14px 40px rgba(18,184,134,.16), 0 4px 10px rgba(32,48,43,.08);
+  --log-bg: #15211d;
+  --log-text: #d3ece2;
+}
+
+* { box-sizing: border-box; }
+.hidden { display: none !important; }
+
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── App 外框 ── */
+.app { display: grid; grid-template-columns: 248px 1fr; height: 100vh; overflow: hidden; }
+
+/* ── 左侧导航 ── */
+.sidebar {
+  background: var(--nav-bg);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 18px 14px; gap: 4px; overflow-y: auto;
+}
+.brand {
+  display: flex; align-items: center; gap: 11px;
+  padding: 6px 8px 18px; margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.brand-mark {
+  width: 34px; height: 34px; border-radius: var(--radius-sm);
+  background: var(--accent); color: var(--on-accent);
+  display: grid; place-items: center; flex-shrink: 0;
+}
+.brand-mark svg { width: 19px; height: 19px; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.brand-text .name { font-family: var(--font-display); font-weight: 700; font-size: 14px; letter-spacing: -.01em; white-space: nowrap; }
+.brand-text .tag { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+.nav-group { margin-top: 14px; }
+.nav-group-label {
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); padding: 0 9px 6px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 9px; border-radius: var(--radius-sm);
+  color: var(--text-2); cursor: pointer; font-size: 13.5px; font-weight: 500;
+  border: none; background: transparent; width: 100%; text-align: left;
+  font-family: inherit; transition: background .14s, color .14s;
+}
+.nav-item svg { width: 17px; height: 17px; flex-shrink: 0; opacity: .85; }
+.nav-item:hover { background: var(--surface-hover); color: var(--text); }
+.nav-item.active { background: var(--nav-active); color: var(--nav-active-text); font-weight: 600; }
+.nav-item.active svg { opacity: 1; }
+.nav-badge {
+  margin-left: auto; font-size: 11px; font-weight: 600; font-family: var(--font-mono);
+  padding: 1px 7px; border-radius: 999px; background: var(--surface-2); color: var(--text-2);
+}
+.nav-item.active .nav-badge { background: var(--accent); color: var(--on-accent); }
+
+.sidebar-foot { margin-top: auto; padding-top: 14px; }
+.log-reopen {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 9px 10px; border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-strong); background: transparent;
+  color: var(--text-2); cursor: pointer; font-family: inherit; font-size: 12.5px; font-weight: 500;
+  transition: all .14s;
+}
+.log-reopen:hover { border-color: var(--accent); color: var(--accent); }
+.log-reopen svg { width: 16px; height: 16px; }
+
+/* ── 右侧主区 ── */
+.main { display: flex; flex-direction: column; overflow: hidden; }
+.topbar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 26px; height: 60px; flex-shrink: 0;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.page-title { font-family: var(--font-display); font-size: 17px; font-weight: 700; letter-spacing: -.01em; }
+.page-sub { font-size: 12.5px; color: var(--muted); margin-left: -8px; }
+.topbar-spacer { flex: 1; }
+.icon-btn {
+  width: 36px; height: 36px; display: grid; place-items: center;
+  border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--surface); color: var(--text-2); cursor: pointer; transition: all .14s;
+}
+.icon-btn:hover { color: var(--accent); border-color: var(--accent); }
+.icon-btn svg { width: 18px; height: 18px; }
+
+.content { flex: 1; overflow-y: auto; padding: 24px 26px 60px; }
+.page { display: none; }
+.page.active { display: block; animation: fade .25s ease; }
+@keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* ── KPI 状态条 ── */
+.kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 22px; }
+.kpi {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 15px 16px; box-shadow: var(--shadow-card);
+}
+.kpi .k-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.kpi .k-label { font-size: 12px; color: var(--text-2); font-weight: 500; }
+.kpi .k-dot { width: 8px; height: 8px; border-radius: 50%; }
+.kpi .k-val { font-family: var(--font-display); font-size: 30px; font-weight: 700; letter-spacing: -.02em; line-height: 1; }
+.kpi.t-total .k-val { color: var(--text); }
+.kpi.t-ok   .k-val { color: var(--ok); }   .kpi.t-ok   .k-dot { background: var(--ok); }
+.kpi.t-warn .k-val { color: var(--warn); } .kpi.t-warn .k-dot { background: var(--warn); }
+.kpi.t-info .k-val { color: var(--info); } .kpi.t-info .k-dot { background: var(--info); }
+.kpi.t-bad  .k-val { color: var(--bad); }  .kpi.t-bad  .k-dot { background: var(--bad); }
+.kpi .k-foot { font-size: 11px; color: var(--muted); margin-top: 6px; font-family: var(--font-mono); }
+
+/* ── 卡片 ── */
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-card); padding: 20px; margin-bottom: 18px;
+}
+.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.card-head .ch-icon {
+  width: 30px; height: 30px; border-radius: var(--radius-sm);
+  background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; flex-shrink: 0;
+}
+.card-head .ch-icon.alt { background: var(--accent-2-soft); color: var(--accent-2); }
+.card-head .ch-icon svg { width: 17px; height: 17px; }
+.card-head h2 { margin: 0; font-family: var(--font-display); font-size: 15.5px; font-weight: 700; letter-spacing: -.01em; }
+.card-head .ch-sub { font-size: 12px; color: var(--muted); margin-left: auto; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1180px){ .grid-2 { grid-template-columns: 1fr; } }
+
+/* 运行结果页：左右分栏（左 注册结果 宽，右 运行记录 窄） */
+.split-2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 1240px){ .split-2 { grid-template-columns: 1fr; } }
+
+/* ── 表单 ── */
+.field { margin-bottom: 14px; }
+.field > label { display: block; font-size: 12.5px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
+.field .hint-inline { font-weight: 400; color: var(--muted); margin-left: 6px; font-size: 11.5px; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; font-family: var(--font-ui); font-size: 13px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  padding: 9px 11px; transition: border-color .14s, box-shadow .14s;
+}
+textarea { resize: vertical; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; }
+input::placeholder, textarea::placeholder { color: var(--muted); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.field-mono input { font-family: var(--font-mono); }
+
+/* ── 按钮 ── */
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+  padding: 9px 15px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  cursor: pointer; transition: all .14s; white-space: nowrap;
+}
+.btn svg { width: 15px; height: 15px; }
+.btn:hover { border-color: var(--accent); color: var(--accent); background: var(--surface-hover); }
+.btn-primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--on-accent); }
+.btn-ghost { background: transparent; border-color: transparent; }
+.btn-ghost:hover { background: var(--surface-hover); }
+.btn-danger { color: var(--bad); border-color: var(--border-strong); }
+.btn-danger:hover { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+.btn-sm { padding: 6px 11px; font-size: 12px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.toolbar .tb-spacer { flex: 1; }
+
+/* ── 段控 ── */
+.seg { display: inline-flex; gap: 2px; padding: 3px; background: var(--surface-2); border-radius: var(--radius-sm); border: 1px solid var(--border); }
+.seg button {
+  border: none; background: transparent; padding: 5px 12px; border-radius: calc(var(--radius-sm) - 2px);
+  font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--text-2); cursor: pointer; transition: all .14s;
+}
+.seg button.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-card); }
+
+/* ── 表格 ── */
+.table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+thead th {
+  text-align: left; padding: 11px 14px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  background: var(--surface-2); border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border); color: var(--text-2); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr { transition: background .12s; }
+tbody tr:hover { background: var(--surface-hover); }
+.cell-mono { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); }
+.cell-email { font-weight: 600; color: var(--text); }
+.cell-token {
+  font-family: var(--font-mono); font-size: 11px; color: var(--muted);
+  max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-block; vertical-align: middle;
+}
+td.col-check, th.col-check { width: 38px; text-align: center; }
+input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; font-family: var(--font-ui);
+}
+.badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+.badge.s-available { background: var(--ok-soft); color: var(--ok); }   .badge.s-available::before { background: var(--ok); }
+.badge.s-in_use { background: var(--warn-soft); color: var(--warn); }  .badge.s-in_use::before { background: var(--warn); }
+.badge.s-done { background: var(--info-soft); color: var(--info); }    .badge.s-done::before { background: var(--info); }
+.badge.s-failed { background: var(--bad-soft); color: var(--bad); }    .badge.s-failed::before { background: var(--bad); }
+.badge.s-running { background: var(--warn-soft); color: var(--warn); } .badge.s-running::before { background: var(--warn); }
+
+.row-actions { display: flex; gap: 4px; }
+.row-actions button {
+  width: 28px; height: 28px; display: grid; place-items: center;
+  border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius-sm);
+  color: var(--muted); cursor: pointer; transition: all .14s;
+}
+.row-actions button:hover { color: var(--accent); border-color: var(--accent); }
+.row-actions button.danger:hover { color: var(--bad); border-color: var(--bad); }
+.row-actions svg { width: 14px; height: 14px; }
+
+/* ── 提示条 ── */
+.hint {
+  font-size: 12.5px; color: var(--text-2); line-height: 1.6;
+  background: var(--surface-2); border-left: 3px solid var(--accent);
+  padding: 11px 14px; border-radius: var(--radius-sm); margin-bottom: 16px;
+}
+.hint code { font-family: var(--font-mono); font-size: 11.5px; background: var(--accent-soft); color: var(--accent); padding: 1px 5px; border-radius: 4px; }
+.hint b { color: var(--text); }
+
+fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin: 0 0 16px; }
+legend { font-family: var(--font-display); font-weight: 700; font-size: 13px; padding: 0 8px; color: var(--text); letter-spacing: -.01em; }
+.check-line { display: flex; align-items: flex-start; gap: 9px; padding: 8px 0; cursor: pointer; }
+.check-line input { margin-top: 2px; }
+.check-line .cl-text { font-size: 13px; }
+.check-line .cl-text b { font-weight: 600; }
+.check-line .cl-text small { display: block; color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+
+/* 进度条 */
+.progress { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin: 4px 0; }
+.progress > i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+.worker-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--surface-2); border-radius: var(--radius-sm); margin-top: 8px; font-size: 12.5px; }
+.worker-row .w-id { font-family: var(--font-mono); font-weight: 600; color: var(--accent); }
+.worker-row .w-mail { font-family: var(--font-mono); color: var(--text-2); }
+.worker-row .w-stage { margin-left: auto; color: var(--muted); }
+
+/* 分区分隔（ChatGPT 页内两块之间） */
+.section-split { height: 1px; background: var(--border); margin: 22px 0; border: none; }
+
+/* ══════════════════════════════════════════════════════════════
+   全局悬浮日志窗
+   ══════════════════════════════════════════════════════════════ */
+.logwin {
+  position: fixed; width: 460px; height: 320px; min-width: 320px; min-height: 140px;
+  background: var(--log-bg); border-radius: var(--radius); box-shadow: var(--shadow-float);
+  display: flex; flex-direction: column; overflow: hidden; z-index: 900;
+  border: 1px solid rgba(255,255,255,.08);
+}
+.logwin.minimized { height: auto !important; }
+.logwin.minimized .logwin-body, .logwin.minimized .logwin-resize { display: none; }
+.logwin-head {
+  display: flex; align-items: center; gap: 9px; padding: 9px 12px; cursor: grab;
+  background: rgba(255,255,255,.05); border-bottom: 1px solid rgba(255,255,255,.07); user-select: none;
+}
+.logwin-head:active { cursor: grabbing; }
+.logwin.minimized .logwin-head { border-bottom: none; }
+.logwin-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); flex-shrink: 0; }
+.logwin-title { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: rgba(255,255,255,.92); display: flex; align-items: center; gap: 8px; }
+.logwin-title .lw-count { font-size: 10.5px; font-weight: 500; color: rgba(255,255,255,.5); background: rgba(255,255,255,.1); padding: 1px 7px; border-radius: 999px; }
+.logwin-tools { margin-left: auto; display: flex; gap: 4px; }
+.logwin-tools button { width: 24px; height: 24px; display: grid; place-items: center; border: none; background: transparent; color: rgba(255,255,255,.55); border-radius: 6px; cursor: pointer; transition: all .14s; }
+.logwin-tools button:hover { background: rgba(255,255,255,.14); color: #fff; }
+.logwin-tools svg { width: 14px; height: 14px; }
+.logwin-body { flex: 1; overflow-y: auto; padding: 10px 12px; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.65; color: var(--log-text); }
+.logwin-body::-webkit-scrollbar { width: 8px; }
+.logwin-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.15); border-radius: 4px; }
+.log-line { white-space: pre-wrap; word-break: break-all; padding: 1px 0; }
+.log-line .ts { color: rgba(255,255,255,.32); margin-right: 8px; }
+.log-line.err .msg { color: #ff8694; }
+.log-line.warn .msg { color: #ffce7a; }
+.log-line.ok .msg { color: #86f0b0; }
+.log-line.evt .msg { color: #d8a8ff; font-weight: 600; }
+.log-line.info .msg { color: var(--log-text); }
+.logwin-resize { position: absolute; right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; z-index: 2; }
+.logwin-resize::after { content: ""; position: absolute; right: 3px; bottom: 3px; width: 8px; height: 8px; border-right: 2px solid rgba(255,255,255,.35); border-bottom: 2px solid rgba(255,255,255,.35); }
+
+.log-fab {
+  position: fixed; right: 24px; bottom: 24px; z-index: 901;
+  display: flex; align-items: center; gap: 8px; padding: 11px 16px; border-radius: 999px;
+  background: var(--accent); color: var(--on-accent); border: none; box-shadow: var(--shadow-float);
+  cursor: pointer; font-family: var(--font-ui); font-size: 13px; font-weight: 600;
+}
+.log-fab svg { width: 17px; height: 17px; }
+
+.content::-webkit-scrollbar, .sidebar::-webkit-scrollbar { width: 10px; }
+.content::-webkit-scrollbar-thumb, .sidebar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 3px solid var(--bg); }
+
+.demo-tip {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 500; box-shadow: var(--shadow-float); z-index: 950;
+  opacity: 0; pointer-events: none; transition: opacity .3s; white-space: nowrap;
+}
+.demo-tip.show { opacity: .95; }
+</style>
+</head>
+<body>
+
+<!-- ══════════ SVG 图标库（线性图标）══════════ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.09 12.97a1 1 0 0 0 .76 1.63H11l-1 7.4 8.91-10.97a1 1 0 0 0-.76-1.63H12l1-6.8z"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2"/><path d="M12 18h.01"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4l14 8-14 8V4z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 12h14"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-export" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.94 14.06 4 20m11.06-5.94L20 9m-8-7v4m0 12v4m10-10h-4M6 12H2"/><circle cx="12" cy="12" r="3.2"/></symbol>
+  <symbol id="i-message" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></symbol>
+</svg>
+
+<div class="app">
+  <!-- ════════ 左侧导航 ════════ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><svg><use href="#i-bolt"/></svg></div>
+      <div class="brand-text">
+        <span class="name">Outlook Register</span>
+        <span class="tag">纯协议 · 接码注册控制台</span>
+      </div>
+    </div>
+
+    <nav class="nav-group">
+      <div class="nav-group-label">注册</div>
+      <button class="nav-item active" data-page="chatgpt">
+        <svg><use href="#i-message"/></svg> ChatGPT
+        <span class="nav-badge">3 跑</span>
+      </button>
+    </nav>
+
+    <nav class="nav-group">
+      <div class="nav-group-label">数据</div>
+      <button class="nav-item" data-page="pool">
+        <svg><use href="#i-layers"/></svg> 号池
+        <span class="nav-badge">128</span>
+      </button>
+      <button class="nav-item" data-page="results">
+        <svg><use href="#i-check-circle"/></svg> 运行结果
+        <span class="nav-badge">86</span>
+      </button>
+    </nav>
+
+    <nav class="nav-group">
+      <div class="nav-group-label">配置</div>
+      <button class="nav-item" data-page="mailsms">
+        <svg><use href="#i-mail"/></svg> 邮箱/接码
+      </button>
+      <button class="nav-item" data-page="export">
+        <svg><use href="#i-export"/></svg> 自动导出
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <button class="log-reopen" id="navLogToggle">
+        <svg><use href="#i-terminal"/></svg> 实时日志浮窗
+      </button>
+    </div>
+  </aside>
+
+  <!-- ════════ 右侧主区 ════════ -->
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title" id="pageTitle">ChatGPT</span>
+      <span class="page-sub" id="pageSub">单个注册 + 自动跑号池</span>
+      <div class="topbar-spacer"></div>
+      <button class="icon-btn" title="通知"><svg><use href="#i-bell"/></svg></button>
+      <button class="icon-btn" title="设置"><svg><use href="#i-settings"/></svg></button>
+    </header>
+
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<!-- ════════ 全局悬浮日志窗 ════════ -->
+<div class="logwin" id="logwin">
+  <div class="logwin-head" id="logwinHead">
+    <span class="logwin-dot"></span>
+    <span class="logwin-title">
+      <svg width="14" height="14" style="opacity:.7"><use href="#i-terminal"/></svg>
+      实时日志
+      <span class="lw-count" id="logCount">实时</span>
+    </span>
+    <div class="logwin-tools">
+      <button id="logMin" title="最小化"><svg><use href="#i-minus"/></svg></button>
+      <button id="logClose" title="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+  </div>
+  <div class="logwin-body" id="logBody"></div>
+  <div class="logwin-resize" id="logResize"></div>
+</div>
+
+<button class="log-fab hidden" id="logFab">
+  <svg><use href="#i-terminal"/></svg> 打开日志
+</button>
+
+<div class="demo-tip" id="demoTip"></div>
+
+<script>
+// ════════════════════════════════════════════════════════════
+// 假数据
+// ════════════════════════════════════════════════════════════
+const POOL = [
+  { email: "charles8821@outlook.jp", status: "available", reason: "" },
+  { email: "mika.tanaka042@outlook.com", status: "in_use", reason: "" },
+  { email: "yuki_h99@hotmail.com", status: "done", reason: "" },
+  { email: "renz.0417@outlook.jp", status: "failed", reason: "OTP 超时（180s）" },
+  { email: "sora.kawano@outlook.com", status: "available", reason: "" },
+  { email: "akira_m@hotmail.co.jp", status: "done", reason: "" },
+  { email: "nina.petrova7@outlook.com", status: "failed", reason: "add-phone 风控拦截" },
+  { email: "leo.fischer22@outlook.jp", status: "available", reason: "" },
+  { email: "haruki.s@outlook.com", status: "in_use", reason: "" },
+  { email: "emma.dubois3@hotmail.com", status: "done", reason: "" },
+];
+const RESULTS = [
+  { email: "yuki_h99@hotmail.com", at: "06-26 14:32", at_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIi", st: "sess-AbqK9x2mLpZ", rt: "M.C538_BAY.0.U.-Cm9Xq2", hasRt: true },
+  { email: "akira_m@hotmail.co.jp", at: "06-26 14:18", at_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3Mi", st: "sess-Pw82nMq04Lz", rt: "M.C107_BL2.0.U.-Ak72mn", hasRt: true },
+  { email: "emma.dubois3@hotmail.com", at: "06-26 13:55", at_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQi", st: "sess-Lk93mzQ81Xc", rt: "", hasRt: false },
+  { email: "haruki.matsu@outlook.jp", at: "06-26 13:40", at_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAi", st: "sess-Zx01pqW73Nv", rt: "M.C538_SN1.0.U.-Hm03kx", hasRt: true },
+  { email: "lucas.weber5@outlook.com", at: "06-26 13:22", at_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJraWQi", st: "sess-Qm71vbN92Kp", rt: "M.C512_BL2.0.U.-Tn88pq", hasRt: true },
+];
+const RUNS = [
+  { id: "run_8f3a21", email: "yuki_h99@hotmail.com", status: "done", at: "14:30:12", err: "" },
+  { id: "run_7b1c09", email: "renz.0417@outlook.jp", status: "failed", at: "14:22:48", err: "OTP 超时" },
+  { id: "run_6a9e44", email: "haruki.s@outlook.com", status: "running", at: "14:35:01", err: "" },
+  { id: "run_5d2f81", email: "akira_m@hotmail.co.jp", status: "done", at: "14:15:33", err: "" },
+  { id: "run_4c8a17", email: "nina.petrova7@outlook.com", status: "failed", at: "14:08:55", err: "风控拦截" },
+  { id: "run_3b6e92", email: "emma.dubois3@hotmail.com", status: "done", at: "13:55:20", err: "" },
+];
+
+const PAGE_META = {
+  chatgpt: ["ChatGPT", "单个注册 + 自动跑号池"],
+  pool:    ["号池", "Outlook 接码号的导入与状态管理"],
+  results: ["运行结果", "注册凭证 + 执行历史"],
+  mailsms: ["邮箱/接码", "OTP 收件通道（邮箱）+ 手机验证通道（SMS）"],
+  export:  ["自动导出", "注册成功后把凭证推送到 CPA / SUB2API 面板"],
+};
+
+// ════════════════════════════════════════════════════════════
+// 渲染辅助
+// ════════════════════════════════════════════════════════════
+function statusBadge(s){
+  const label = { available:"available", in_use:"in_use", done:"done", failed:"failed", running:"running" }[s] || s;
+  return `<span class="badge s-${s}">${label}</span>`;
+}
+function rowAction(icon, cls=""){ return `<button class="${cls}"><svg><use href="#i-${icon}"/></svg></button>`; }
+
+function kpiBar(){
+  return `<div class="kpis">
+    <div class="kpi t-total"><div class="k-top"><span class="k-label">总计</span><span class="k-dot" style="background:var(--muted)"></span></div><div class="k-val">128</div><div class="k-foot">号池总量</div></div>
+    <div class="kpi t-ok"><div class="k-top"><span class="k-label">可用</span><span class="k-dot"></span></div><div class="k-val">64</div><div class="k-foot">available</div></div>
+    <div class="kpi t-warn"><div class="k-top"><span class="k-label">进行中</span><span class="k-dot"></span></div><div class="k-val">3</div><div class="k-foot">in_use</div></div>
+    <div class="kpi t-info"><div class="k-top"><span class="k-label">已完成</span><span class="k-dot"></span></div><div class="k-val">86</div><div class="k-foot">done</div></div>
+    <div class="kpi t-bad"><div class="k-top"><span class="k-label">失败</span><span class="k-dot"></span></div><div class="k-val">12</div><div class="k-foot">failed</div></div>
+  </div>`;
+}
+
+// ════════════════════════════════════════════════════════════
+// 页面模板
+// ════════════════════════════════════════════════════════════
+const TEMPLATES = {
+  // —— 注册 → ChatGPT：单个注册 + 自动跑号池，同一页两块 ——
+  chatgpt: () => `
+    ${kpiBar()}
+
+    <div class="card">
+      <div class="card-head">
+        <div class="ch-icon"><svg><use href="#i-bolt"/></svg></div>
+        <h2>单个注册</h2>
+        <span class="ch-sub">手动触发一个账号</span>
+      </div>
+      <div class="grid-2">
+        <div>
+          <div class="field field-mono">
+            <label>邮箱 <span class="hint-inline">留空 = 自动 claim 下一个 available</span></label>
+            <input type="text" placeholder="留空自动选号 / 或填指定邮箱">
+          </div>
+          <div class="field field-mono">
+            <label>代理 <span class="hint-inline">直连留空</span></label>
+            <input type="text" placeholder="socks5://user:pass@host:1080">
+          </div>
+          <div class="field">
+            <label>OTP 等待秒数</label>
+            <input type="number" value="180" min="30" max="600">
+          </div>
+        </div>
+        <div>
+          <div class="hint" style="margin-top:2px">手动注册单个账号：留空邮箱会自动从号池领取下一个 <code>available</code> 号；也可指定邮箱定向注册。OTP 默认等待 180 秒。</div>
+          <div class="toolbar" style="margin-top:6px">
+            <button class="btn btn-primary"><svg><use href="#i-play"/></svg> 开始注册</button>
+            <button class="btn" disabled><svg><use href="#i-stop"/></svg> 停止当前</button>
+            <span style="font-size:12px;color:var(--muted)">就绪</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="ch-icon alt"><svg><use href="#i-spark"/></svg></div>
+        <h2>自动跑号池</h2>
+        <span class="ch-sub" style="color:var(--ok);font-weight:600">● 运行中 · 3 worker</span>
+      </div>
+      <div class="hint">多 worker 并发从号池取 available 号注册。每个 worker 跑完一个号按<b>冷却时间</b>停顿防风控；<b>代理池</b>按行轮流分配给各 worker。</div>
+      <div class="grid-2">
+        <div>
+          <div class="field"><label>并发数 <span class="hint-inline">同时跑几个注册流程</span></label><input type="number" value="3" min="1" max="20"></div>
+          <div class="field"><label>冷却秒数 <span class="hint-inline">每个 worker 跑完一个号的停顿</span></label><input type="number" value="3" min="0" max="120"></div>
+        </div>
+        <div class="field field-mono" style="display:flex;flex-direction:column;margin-bottom:0">
+          <label>代理池 <span class="hint-inline">每行一个，worker 顺序轮取</span></label>
+          <textarea rows="5" style="flex:1">socks5://127.0.0.1:7890
+socks5://127.0.0.1:7891
+http://gw.proxy.io:8080</textarea>
+        </div>
+      </div>
+      <div class="toolbar" style="margin:4px 0 18px">
+        <button class="btn" disabled><svg><use href="#i-play"/></svg> 启动</button>
+        <button class="btn"><svg><use href="#i-pause"/></svg> 暂停</button>
+        <button class="btn btn-danger"><svg><use href="#i-stop"/></svg> 停止</button>
+        <div class="tb-spacer"></div>
+        <span style="font-size:12.5px;color:var(--text-2);font-weight:600">本批次已完成 24 / 失败 5</span>
+      </div>
+      <div class="progress"><i style="width:62%"></i></div>
+      <div style="font-size:12px;color:var(--muted);font-family:var(--font-mono);margin:6px 0 10px">24 / 39 完成 · 62%</div>
+      <div class="worker-row"><span class="w-id">W0</span><span class="w-mail">sora.kawano@outlook.com</span><span class="w-stage">等待 OTP…</span></div>
+      <div class="worker-row"><span class="w-id">W1</span><span class="w-mail">leo.fischer22@outlook.jp</span><span class="w-stage">add-phone 验证中…</span></div>
+      <div class="worker-row"><span class="w-id">W2</span><span class="w-mail">haruki.s@outlook.com</span><span class="w-stage">提交注册表单…</span></div>
+    </div>`,
+
+  // —— 数据 → 号池 ——
+  pool: () => `
+    ${kpiBar()}
+    <div class="card">
+      <div class="card-head">
+        <div class="ch-icon"><svg><use href="#i-layers"/></svg></div>
+        <h2>号池管理</h2>
+        <span class="ch-sub">共 128 个号</span>
+      </div>
+      <div class="toolbar">
+        <div class="seg">
+          <button class="active">全部</button><button>available</button><button>in_use</button><button>done</button><button>failed</button>
+        </div>
+        <div class="tb-spacer"></div>
+        <button class="btn btn-sm"><svg><use href="#i-refresh"/></svg> 重试 failed</button>
+        <button class="btn btn-sm">♻ 释放卡死号</button>
+        <button class="btn btn-sm btn-danger"><svg><use href="#i-trash"/></svg> 删选中</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th class="col-check"><input type="checkbox"></th>
+            <th>邮箱</th><th>状态</th><th>失败原因</th><th style="width:90px">操作</th>
+          </tr></thead>
+          <tbody>
+            ${POOL.map(p=>`<tr>
+              <td class="col-check"><input type="checkbox"></td>
+              <td class="cell-email">${p.email}</td>
+              <td>${statusBadge(p.status)}</td>
+              <td style="color:${p.reason?'var(--bad)':'var(--muted)'}">${p.reason||"—"}</td>
+              <td><div class="row-actions">${rowAction("refresh")}${rowAction("trash","danger")}</div></td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>`,
+
+  // —— 数据 → 运行结果：左右分栏（左 注册结果 · 右 运行记录）——
+  results: () => `
+    ${kpiBar()}
+    <div class="split-2">
+      <!-- 左：注册结果 -->
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head">
+          <div class="ch-icon"><svg><use href="#i-check-circle"/></svg></div>
+          <h2>注册结果</h2>
+          <span class="ch-sub">86 条凭证</span>
+        </div>
+        <div class="toolbar">
+          <div class="seg"><button class="active">全部</button><button>有 RT</button><button>无 RT</button></div>
+          <div class="tb-spacer"></div>
+          <button class="btn btn-sm"><svg><use href="#i-export"/></svg> CPA</button>
+          <button class="btn btn-sm"><svg><use href="#i-export"/></svg> Sub2API</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th class="col-check"><input type="checkbox"></th>
+              <th>邮箱</th><th>access</th><th>refresh</th><th>时间</th><th style="width:64px">操作</th>
+            </tr></thead>
+            <tbody>
+              ${RESULTS.map(r=>`<tr>
+                <td class="col-check"><input type="checkbox"></td>
+                <td class="cell-email">${r.email}</td>
+                <td><span class="cell-token">${r.at_token}…</span></td>
+                <td>${r.hasRt?`<span class="cell-token">${r.rt}</span>`:'<span style="color:var(--muted);font-size:11px">无</span>'}</td>
+                <td class="cell-mono">${r.at}</td>
+                <td><div class="row-actions">${rowAction("eye")}${rowAction("copy")}</div></td>
+              </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 右：运行记录 -->
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head">
+          <div class="ch-icon alt"><svg><use href="#i-history"/></svg></div>
+          <h2>运行记录</h2>
+          <span class="ch-sub">最近执行</span>
+        </div>
+        <div class="toolbar">
+          <button class="btn btn-sm"><svg><use href="#i-refresh"/></svg> 刷新</button>
+          <span style="font-size:11.5px;color:var(--muted);margin-left:2px">每条注册流程的执行历史</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>run_id</th><th>状态</th><th>开始</th></tr></thead>
+            <tbody>
+              ${RUNS.map(r=>`<tr>
+                <td>
+                  <div class="cell-mono">${r.id}</div>
+                  <div style="font-size:11px;color:var(--muted);margin-top:2px">${r.email}</div>
+                  ${r.err?`<div style="font-size:11px;color:var(--bad);margin-top:2px">⚠ ${r.err}</div>`:''}
+                </td>
+                <td>${statusBadge(r.status)}</td>
+                <td class="cell-mono">${r.at}</td>
+              </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`,
+
+  // —— 配置 → 邮箱/接码：左右分栏（左 邮箱来源 · 右 SMS 接码）——
+  mailsms: () => `
+    <div class="split-2">
+      <!-- 左：邮箱来源 -->
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head">
+          <div class="ch-icon"><svg><use href="#i-mail"/></svg></div>
+          <h2>邮箱来源</h2>
+          <span class="ch-sub">OTP 邮件通道</span>
+        </div>
+        <div class="hint">OpenAI 注册需要邮箱收 OTP。可选 <b>Outlook 接码池</b>（从号池 claim），或用自建 <b>CF Worker catch-all 邮箱</b>。</div>
+        <div class="field">
+          <label>邮箱来源</label>
+          <select><option>Outlook 接码池</option><option>CF Temp Email</option></select>
+        </div>
+        <fieldset>
+          <legend>批量导入接码号</legend>
+          <div class="hint" style="background:transparent;border:none;padding:0;margin-bottom:10px">每行一个，4 段格式用 <code>----</code> 分隔：<code>email----password----client_id----refresh_token</code></div>
+          <textarea rows="7" placeholder="charles123@outlook.jp----P@ssw0rd----9e5f94bc-...----M.C538_..."></textarea>
+          <div class="toolbar" style="margin:14px 0 0">
+            <button class="btn btn-primary"><svg><use href="#i-upload"/></svg> 导入到号池</button>
+            <button class="btn">保存配置</button>
+          </div>
+        </fieldset>
+      </div>
+
+      <!-- 右：SMS 接码 -->
+      <div class="card" style="margin-bottom:0">
+        <div class="card-head">
+          <div class="ch-icon alt"><svg><use href="#i-phone"/></svg></div>
+          <h2>SMS 接码</h2>
+          <span class="ch-sub">手机验证通道</span>
+        </div>
+        <label class="check-line"><input type="checkbox" checked><span class="cl-text"><b>启用 SMS 接码</b><small>命中 add-phone 时自动租号，否则回退到环境变量路径</small></span></label>
+        <div class="field" style="margin-top:12px">
+          <label>接码平台</label>
+          <select><option>自定义接码</option><option>SmsBower</option></select>
+        </div>
+        <div class="grid-2">
+          <div class="field"><label>默认国家</label><select><option>Indonesia (6)</option><option>Philippines (4)</option></select></div>
+          <div class="field"><label>Service 代码 <span class="hint-inline">OpenAI = dr</span></label><input type="text" value="dr"></div>
+        </div>
+        <fieldset>
+          <legend>自动选择最优国家</legend>
+          <label class="check-line"><input type="checkbox"><span class="cl-text"><b>启用自动选国家</b><small>从允许列表里按价格 + 库存自动挑最优</small></span></label>
+          <div class="grid-2" style="margin-top:8px">
+            <div class="field"><label>最低库存</label><input type="number" value="20"></div>
+            <div class="field"><label>最高单价（0=不限）</label><input type="number" value="0"></div>
+          </div>
+        </fieldset>
+        <div class="toolbar" style="margin-bottom:0">
+          <button class="btn btn-primary">保存配置</button>
+          <button class="btn"><svg><use href="#i-plug"/></svg> 测试余额</button>
+        </div>
+      </div>
+    </div>`,
+
+  // —— 配置 → 自动导出 ——
+  export: () => `
+    <div class="card">
+      <div class="card-head">
+        <div class="ch-icon"><svg><use href="#i-export"/></svg></div>
+        <h2>注册完成后自动导出</h2>
+      </div>
+      <div class="hint">勾选启用后，每次注册成功并落库后，把凭证导出到对应面板。<b>没勾选时完全不执行</b>，导出失败只记日志，不影响注册结果。</div>
+      <fieldset>
+        <legend>CPA 面板</legend>
+        <label class="check-line"><input type="checkbox"><span class="cl-text"><b>启用 CPA 自动导出</b><small>POST /v0/management/auth-files，导入 codex auth JSON</small></span></label>
+        <div class="field" style="margin-top:10px"><label>CPA URL</label><input type="text" placeholder="https://cpa.example.com" class="field-mono"></div>
+        <div class="field field-mono"><label>管理密钥</label><input type="password" placeholder="留空表示不修改（已设置）"></div>
+        <div class="toolbar" style="margin-bottom:0"><button class="btn btn-sm"><svg><use href="#i-plug"/></svg> 测试连通性</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>SUB2API 订阅管理面板</legend>
+        <label class="check-line"><input type="checkbox" checked><span class="cl-text"><b>启用 SUB2API 自动导出</b><small>POST /api/v1/admin/accounts，x-api-key 鉴权</small></span></label>
+        <div class="field" style="margin-top:10px"><label>SUB2API URL</label><input type="text" value="https://sub2api.example.com" class="field-mono"></div>
+        <div class="field"><label>分组 IDs <span class="hint-inline">逗号分隔，默认 2</span></label><input type="text" value="2" class="field-mono"></div>
+        <div class="toolbar" style="margin-bottom:0"><button class="btn btn-sm"><svg><use href="#i-plug"/></svg> 测试连通性</button></div>
+      </fieldset>
+      <div class="toolbar" style="margin-bottom:0"><button class="btn btn-primary">保存配置</button></div>
+    </div>`,
+};
+
+// ════════════════════════════════════════════════════════════
+// 导航切换
+// ════════════════════════════════════════════════════════════
+const content = document.getElementById('content');
+function renderPage(page){
+  content.innerHTML = TEMPLATES[page] ? TEMPLATES[page]() : '<div class="card">页面建设中</div>';
+  content.scrollTop = 0;
+  const [t, s] = PAGE_META[page] || ["", ""];
+  document.getElementById('pageTitle').textContent = t;
+  document.getElementById('pageSub').textContent = s;
+}
+document.querySelectorAll('.nav-item').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    renderPage(btn.dataset.page);
+  });
+});
+
+// ════════════════════════════════════════════════════════════
+// 悬浮日志窗
+// ════════════════════════════════════════════════════════════
+const logwin = document.getElementById('logwin');
+const logBody = document.getElementById('logBody');
+const LOG_SEED = [
+  ["info","worker pool started · concurrency=3"],
+  ["evt","[W0] claim available → sora.kawano@outlook.com"],
+  ["info","[W0] proxy = socks5://127.0.0.1:7890"],
+  ["ok","[W2] register form submitted (200)"],
+  ["info","[W1] requesting SMS · country=Indonesia service=dr"],
+  ["warn","[W1] add-phone challenge detected, renting number…"],
+  ["ok","[W1] phone rented +6281xxx · waiting code"],
+  ["evt","[W2] OTP received: 4-9-2-7-1-0"],
+  ["ok","[W2] done → haruki.s@outlook.com · RT captured"],
+  ["err","[W?] renz.0417@outlook.jp failed · OTP timeout 180s"],
+  ["info","export → SUB2API · POST /api/v1/admin/accounts (200)"],
+  ["ok","[W2] credential persisted · id=86"],
+];
+let logTime = 32*60 + 10;
+function fmtTime(sec){ const m=String(Math.floor(sec/60)%60).padStart(2,'0'); const s=String(sec%60).padStart(2,'0'); return `14:${m}:${s}`; }
+function pushLog(kind, msg){
+  const line = document.createElement('div');
+  line.className = `log-line ${kind}`;
+  logTime += Math.floor(Math.random()*4)+1;
+  line.innerHTML = `<span class="ts">${fmtTime(logTime)}</span><span class="msg">${msg}</span>`;
+  logBody.appendChild(line);
+  logBody.scrollTop = logBody.scrollHeight;
+  while (logBody.children.length > 60) logBody.removeChild(logBody.firstChild);
+}
+LOG_SEED.forEach(([k,m])=>pushLog(k,m));
+let seedIdx = 0;
+setInterval(()=>{
+  const extra = [
+    ["info","[W0] still waiting OTP… elapsed 42s"],
+    ["ok","[W0] OTP received: 7-1-0-3-8-8"],
+    ["evt","[W0] account created → sora.kawano@outlook.com"],
+    ["info","[W1] retry with new number +6282xxx"],
+    ["ok","[W1] done · RT captured · id=87"],
+    ["warn","cooldown 3s before next claim"],
+  ];
+  pushLog(...extra[seedIdx % extra.length]);
+  seedIdx++;
+}, 2600);
+
+// —— 默认停靠右下角（按视口计算，自适应任何屏幕尺寸）——
+function dockLogBottomRight(){
+  const margin = 24;                                  // 距屏幕边缘的留白
+  const r = logwin.getBoundingClientRect();
+  const left = Math.max(4, window.innerWidth  - r.width  - margin);
+  const top  = Math.max(4, window.innerHeight - r.height - margin);
+  logwin.style.left = left + 'px';
+  logwin.style.top  = top  + 'px';
+}
+
+// —— 拖拽 ——
+(function makeDraggable(){
+  const head = document.getElementById('logwinHead');
+  let sx, sy, ox, oy, dragging=false;
+  head.addEventListener('mousedown', e=>{
+    if (e.target.closest('.logwin-tools')) return;
+    dragging = true; sx = e.clientX; sy = e.clientY;
+    const r = logwin.getBoundingClientRect(); ox = r.left; oy = r.top;
+    document.body.style.userSelect = 'none';
+  });
+  window.addEventListener('mousemove', e=>{
+    if (!dragging) return;
+    let nx = ox + (e.clientX - sx), ny = oy + (e.clientY - sy);
+    nx = Math.max(4, Math.min(nx, window.innerWidth - 60));
+    ny = Math.max(4, Math.min(ny, window.innerHeight - 40));
+    logwin.style.left = nx + 'px'; logwin.style.top = ny + 'px';
+  });
+  window.addEventListener('mouseup', ()=>{ dragging=false; document.body.style.userSelect=''; });
+})();
+
+// —— 缩放 ——
+(function makeResizable(){
+  const handle = document.getElementById('logResize');
+  let sx, sy, sw, sh, resizing=false;
+  handle.addEventListener('mousedown', e=>{
+    resizing = true; e.preventDefault(); sx = e.clientX; sy = e.clientY;
+    const r = logwin.getBoundingClientRect(); sw = r.width; sh = r.height;
+    document.body.style.userSelect = 'none';
+  });
+  window.addEventListener('mousemove', e=>{
+    if (!resizing) return;
+    logwin.style.width = Math.max(320, sw + (e.clientX - sx)) + 'px';
+    logwin.style.height = Math.max(140, sh + (e.clientY - sy)) + 'px';
+  });
+  window.addEventListener('mouseup', ()=>{ resizing=false; document.body.style.userSelect=''; });
+})();
+
+// —— 最小化 / 关闭 / 重开 ——
+const logFab = document.getElementById('logFab');
+document.getElementById('logMin').addEventListener('click', ()=> logwin.classList.toggle('minimized'));
+document.getElementById('logClose').addEventListener('click', ()=>{ logwin.classList.add('hidden'); logFab.classList.remove('hidden'); });
+function openLog(){ logwin.classList.remove('hidden'); logFab.classList.add('hidden'); dockLogBottomRight(); }
+logFab.addEventListener('click', openLog);
+document.getElementById('navLogToggle').addEventListener('click', ()=>{
+  if (logwin.classList.contains('hidden')) openLog();
+  else logwin.classList.toggle('minimized');
+});
+
+// —— demo tip ——
+let tipTimer;
+function showTip(msg){
+  const tip = document.getElementById('demoTip');
+  tip.textContent = msg; tip.classList.add('show');
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(()=>tip.classList.remove('show'), 1800);
+}
+
+renderPage('chatgpt');
+dockLogBottomRight();
+setTimeout(()=>showTip('日志窗默认在右下角 · 可拖动标题栏移动 · 右下角缩放'), 700);
+</script>
+</body>
+</html>

@@ -234,6 +234,22 @@ def build_sentinel_token(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def is_valid_sentinel_token(token: str) -> bool:
+    """判断 token 是否包含服务端 challenge。
+
+    `c` 为空代表没有拿到 `/sentinel/req` 返回的 server token；这种 fallback
+    会导致后续发码接口表面成功但 OTP silent-drop。
+    QuickJS 路径还会返回 `t`，这里也要求非空。
+    """
+    try:
+        payload = json.loads(token or "")
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(str(payload.get("c") or "").strip() and str(payload.get("t") or "").strip())
+
+
 def get_sentinel_token(
     session,
     device_id: str,

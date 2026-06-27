@@ -67,6 +67,8 @@ def main():
         port=args.port,
         reload=args.reload,
         log_level="info",
+        timeout_keep_alive=1,
+        timeout_graceful_shutdown=2,
     )
 
 

@@ -23,8 +23,9 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, registrar  # noqa: E402
+from . import db, registrar, session_link  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from .proxy_pool import parse_proxy_pool, pick_random_usable_proxy  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
 try:
@@ -43,7 +44,55 @@ logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+
+def _is_shutdown_cancelled(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        return any(_is_shutdown_cancelled(e) for e in nested)
+    return False
+
+
+class _UvicornShutdownNoiseFilter(logging.Filter):
+    """隐藏 Ctrl+C shutdown 时 uvicorn 对正常取消任务打印的长 traceback。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "timeout graceful shutdown exceeded" in msg:
+            return False
+        if record.exc_info and _is_shutdown_cancelled(record.exc_info[1]):
+            return False
+        return True
+
+
+def _install_shutdown_log_filter() -> None:
+    uvicorn_logger = logging.getLogger("uvicorn.error")
+    if any(isinstance(f, _UvicornShutdownNoiseFilter) for f in uvicorn_logger.filters):
+        return
+    uvicorn_logger.addFilter(_UvicornShutdownNoiseFilter())
+
+
+class QuietCancelledMiddleware:
+    """ASGI 外层兜底：关闭服务取消 SSE/HTTP task 时不要把 CancelledError 抛给 uvicorn。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        except BaseException as e:
+            if scope.get("type") == "http" and _is_shutdown_cancelled(e):
+                return
+            raise
+
+
+_install_shutdown_log_filter()
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app.add_middleware(QuietCancelledMiddleware)
 
 
 # ──────────────────────── Pydantic 模型 ────────────────────────
@@ -59,8 +108,28 @@ class RegisterReq(BaseModel):
     want_session_token: bool = True
     want_refresh_token: bool = True
     proxy: str = ""
+    proxy_pool: str = ""
     otp_timeout: int = 180
     allow_existing_login: bool = True
+
+
+class SessionLinkReq(BaseModel):
+    session_text: str = ""
+    session_json: str = ""
+    access_tokens: list[str] = Field(default_factory=list)
+    payment_mode: str = "PayPal 长链接 US/USD"
+    target_amount: str = "0"
+    local_proxy: str = ""
+    proxy: str = ""
+    payment_proxy: str = ""
+    proxy_pool: str = ""
+    payment_proxy_pool: str = ""
+    thread_count: int = 1
+    delay_seconds: int = 2
+
+
+def _pick_proxy_from_pool(text: str, tester=None) -> str:
+    return pick_random_usable_proxy(text, tester=tester)
 
 
 # ──────────────────────── API ────────────────────────
@@ -75,6 +144,37 @@ def health():
 def api_import(req: ImportReq):
     result = db.import_accounts(req.text)
     return {"ok": True, **result, "stats": db.stats()}
+
+
+@app.get("/api/session-link/payment-modes")
+def api_session_link_payment_modes():
+    return {"ok": True, "modes": session_link.CONTROLLER.payment_modes()}
+
+
+@app.post("/api/session-link/run-once")
+def api_session_link_run_once(req: SessionLinkReq):
+    result = session_link.CONTROLLER.generate_once(req.model_dump())
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "生成失败"))
+    return result
+
+
+@app.post("/api/session-link/start")
+def api_session_link_start(req: SessionLinkReq):
+    result = session_link.CONTROLLER.start(req.model_dump())
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "启动失败"))
+    return result
+
+
+@app.post("/api/session-link/stop")
+def api_session_link_stop():
+    return session_link.CONTROLLER.stop()
+
+
+@app.get("/api/session-link/status")
+def api_session_link_status():
+    return session_link.CONTROLLER.status()
 
 
 @app.get("/api/accounts")
@@ -151,6 +251,13 @@ def api_register(req: RegisterReq):
     """启动注册任务，返回 run_id。前端拿 run_id 去 /api/runs/{run_id}/stream 订阅 SSE。"""
     mail_source = db.get_setting("mail_source", "outlook")
     is_cf = (mail_source == "cf_temp")
+    explicit_proxy = (req.proxy or "").strip()
+    pool_has_entries = bool(parse_proxy_pool(req.proxy_pool))
+    pool_proxy = ""
+    if not explicit_proxy and pool_has_entries:
+        pool_proxy = _pick_proxy_from_pool(req.proxy_pool)
+        if not pool_proxy:
+            raise HTTPException(400, "代理池没有可用代理")
 
     if is_cf:
         # CF 模式：不需要 outlook 号池，用虚拟占位 account
@@ -170,11 +277,13 @@ def api_register(req: RegisterReq):
         if not account:
             raise HTTPException(400, "号池里没有 available 账号；请先批量导入")
 
+    proxy = explicit_proxy or pool_proxy
     options = {
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
-        "proxy": req.proxy,
+        "proxy": proxy,
+        "proxy_source": "manual" if explicit_proxy else ("pool" if pool_proxy else "none"),
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
     }
@@ -191,13 +300,15 @@ async def api_stream(run_id: str, request: Request):
         raise HTTPException(404, "run_id not found or finished")
 
     async def event_gen():
-        loop = asyncio.get_event_loop()
         try:
             while True:
                 if await request.is_disconnected():
                     break
-                # 从队列取消息（用 run_in_executor 避免阻塞 event loop）
-                msg = await loop.run_in_executor(None, _safe_get, q)
+                msg = _safe_get(q)
+                if msg == "":
+                    yield ": heartbeat\n\n"
+                    await asyncio.sleep(0.5)
+                    continue
                 if msg is None:
                     # sentinel: 任务结束
                     yield "event: end\ndata: {}\n\n"
@@ -206,6 +317,8 @@ async def api_stream(run_id: str, request: Request):
                     yield f"event: status\ndata: {msg[len('__EVENT__:'):]}\n\n"
                 else:
                     yield f"event: log\ndata: {json.dumps({'line': msg}, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            return
         finally:
             registrar.remove_run_queue(run_id)
 
@@ -220,11 +333,19 @@ async def api_stream(run_id: str, request: Request):
     )
 
 
+@app.post("/api/runs/{run_id}/stop")
+def api_stop_run(run_id: str):
+    res = registrar.stop_run(run_id)
+    if not res.get("ok"):
+        raise HTTPException(404, res.get("message") or "run_id not running")
+    return res
+
+
 def _safe_get(q):
     try:
-        return q.get(timeout=60)
+        return q.get_nowait()
     except Exception:
-        return ""  # 心跳：返空串让 SSE 检查 disconnect
+        return ""  # 心跳：返空串让 SSE 检查 disconnect / shutdown
 
 
 @app.get("/api/runs")
@@ -282,6 +403,7 @@ class SaveMailConfigReq(BaseModel):
     cf_api_url: Optional[str] = None
     cf_admin_token: Optional[str] = None
     cf_domain: Optional[str] = None
+    cf_enable_prefix: Optional[str] = None
 
 
 @app.post("/api/settings/mail")
@@ -300,6 +422,7 @@ def api_test_mail():
     api_url = db.get_setting("cf_api_url", "")
     domain = db.get_setting("cf_domain", "")
     token = db.get_cf_admin_token()
+    enable_prefix = db.get_setting("cf_enable_prefix", "1") != "0"
     if not api_url:
         raise HTTPException(400, "未配置 cf_api_url")
     if not domain:
@@ -313,7 +436,12 @@ def api_test_mail():
         _sys.path.insert(0, str(ROOT_DIR))
     from mail_cf import CFTempEmailProvider
     try:
-        provider = CFTempEmailProvider(api_url=api_url, admin_token=token, domain=domain)
+        provider = CFTempEmailProvider(
+            api_url=api_url,
+            admin_token=token,
+            domain=domain,
+            enable_prefix=enable_prefix,
+        )
         test_email = provider.create_mailbox()
         return {"ok": True, "message": f"连接成功，测试邮箱: {test_email}"}
     except Exception as e:
@@ -344,6 +472,7 @@ class SaveSmsConfigReq(BaseModel):
     sms_auto_max_price: Optional[str] = None
     sms_max_phone_attempts: Optional[str] = None   # 空 = 用 provider 默认；>0 = 自定义
     sms_per_phone_timeout: Optional[str] = None    # 单号等待秒数（默认 80）
+    sms_custom_regex: Optional[str] = None
 
 
 @app.post("/api/settings/sms")
@@ -352,11 +481,50 @@ def api_save_sms_config(req: SaveSmsConfigReq):
     return {"ok": True, "config": db.get_sms_config()}
 
 
+class CustomSmsImportReq(BaseModel):
+    text: str = Field(..., description="手机号----接码API 每行一个")
+
+
+@app.post("/api/settings/sms/custom/import")
+def api_custom_sms_import(req: CustomSmsImportReq):
+    result = db.import_custom_sms_accounts(req.text)
+    return {"ok": True, **result}
+
+
+@app.get("/api/settings/sms/custom/accounts")
+def api_custom_sms_accounts(status: str = "", limit: int = 500):
+    return {
+        "ok": True,
+        "items": db.list_custom_sms_accounts(status=status, limit=limit),
+    }
+
+
+@app.post("/api/settings/sms/custom/accounts/{phone}/reset")
+def api_custom_sms_reset(phone: str):
+    ok = db.reset_custom_sms_to_available(phone)
+    if not ok:
+        raise HTTPException(404, f"手机号 {phone} 不存在")
+    return {"ok": True, "phone": phone}
+
+
+@app.post("/api/settings/sms/custom/accounts/reset_all")
+def api_custom_sms_reset_all():
+    return {"ok": True, "reset": db.reset_all_custom_sms_to_available()}
+
+
+@app.delete("/api/settings/sms/custom/accounts/{phone}")
+def api_custom_sms_delete(phone: str):
+    ok = db.delete_custom_sms_account(phone)
+    if not ok:
+        raise HTTPException(404, f"手机号 {phone} 不存在")
+    return {"ok": True, "phone": phone}
+
+
 @app.post("/api/settings/sms/test")
 def api_test_sms():
     """测试 SMS provider 连通性：查询余额。"""
     cfg = db.get_sms_internal_config()
-    if not cfg.get("sms_api_key"):
+    if cfg.get("sms_provider") != "custom" and not cfg.get("sms_api_key"):
         raise HTTPException(400, "未配置 sms_api_key")
 
     import sys as _sys
@@ -366,6 +534,8 @@ def api_test_sms():
     from sms_provider import create_sms_provider
     try:
         provider = create_sms_provider(cfg["sms_provider"], cfg)
+        if cfg["sms_provider"] == "custom":
+            return {"ok": True, "provider": "custom", "balance": 0, "message": "custom provider 配置正常"}
         balance = provider.get_balance()
         return {
             "ok": True,
@@ -475,7 +645,8 @@ def api_test_export(req: TestExportReq):
 
 
 class ManualExportReq(BaseModel):
-    email: str = Field(..., description="要导出的已注册账号邮箱")
+    email: Optional[str] = Field(None, description="单个邮箱")
+    emails: Optional[list[str]] = Field(None, description="多个邮箱")
     targets: list[str] = Field(default_factory=lambda: ["cpa", "sub2api"],
                                 description="选择导出目标：cpa / sub2api")
 
@@ -488,28 +659,43 @@ def api_manual_export_to_panel(req: ManualExportReq):
     （只要 URL/密钥 等基础配置已填）。
     """
     from . import exporter
-    cred = db.get_registered(req.email)
-    if not cred:
-        raise HTTPException(404, f"未找到已注册账号: {req.email}")
-
     cfg = db.get_export_internal_config()
-    out = {"email": req.email, "cpa": None, "sub2api": None}
     targets = {t.strip().lower() for t in (req.targets or []) if t}
+    if not targets:
+        raise HTTPException(400, "targets 不能为空")
 
-    if "cpa" in targets:
-        cpa_cfg = dict(cfg["cpa"])
-        cpa_cfg["enabled"] = True  # 手动触发：强制启用
-        try:
-            out["cpa"] = exporter.export_to_cpa(cred, cpa_cfg)
-        except Exception as e:
-            out["cpa"] = {"ok": False, "error": str(e)}
-    if "sub2api" in targets:
-        sub2api_cfg = dict(cfg["sub2api"])
-        sub2api_cfg["enabled"] = True
-        try:
-            out["sub2api"] = exporter.export_to_sub2api(cred, sub2api_cfg)
-        except Exception as e:
-            out["sub2api"] = {"ok": False, "error": str(e)}
+    emails = []
+    if req.email:
+        emails.append(req.email)
+    if req.emails:
+        emails.extend(req.emails)
+    emails = [e.strip().lower() for e in emails if e and e.strip()]
+    if not emails:
+        raise HTTPException(400, "email / emails 不能为空")
+
+    out = {"emails": emails, "results": []}
+    for email in emails:
+        cred = db.get_registered(email)
+        if not cred:
+            out["results"].append({"email": email, "ok": False, "error": "not found"})
+            continue
+        item = {"email": email, "cpa": None, "sub2api": None}
+
+        if "cpa" in targets:
+            cpa_cfg = dict(cfg["cpa"])
+            cpa_cfg["enabled"] = True  # 手动触发：强制启用
+            try:
+                item["cpa"] = exporter.export_to_cpa(cred, cpa_cfg)
+            except Exception as e:
+                item["cpa"] = {"ok": False, "error": str(e)}
+        if "sub2api" in targets:
+            sub2api_cfg = dict(cfg["sub2api"])
+            sub2api_cfg["enabled"] = True
+            try:
+                item["sub2api"] = exporter.export_to_sub2api(cred, sub2api_cfg)
+            except Exception as e:
+                item["sub2api"] = {"ok": False, "error": str(e)}
+        out["results"].append(item)
 
     return {"ok": True, **out}
 
@@ -523,7 +709,7 @@ class AutoLoopStartReq(BaseModel):
     want_session_token: bool = True
     want_refresh_token: bool = True
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
-    proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
+    proxy_pool: str = ""         # 多代理池（每行一个）；proxy 为空时随机选可用代理
     concurrency: int = 1         # 并发 worker 数（1-20）
     otp_timeout: int = 180
     allow_existing_login: bool = True
@@ -573,22 +759,22 @@ async def api_auto_stream(request: Request):
     q = AUTO_LOOP.subscribe()
 
     async def gen():
-        loop = asyncio.get_event_loop()
         try:
             while True:
                 if await request.is_disconnected():
                     break
-                # 阻塞拿消息，但每 30s 心跳
-                try:
-                    msg = await loop.run_in_executor(None, lambda: q.get(timeout=30))
-                except Exception:
+                msg = _safe_get(q)
+                if msg == "":
                     yield ": heartbeat\n\n"
+                    await asyncio.sleep(0.5)
                     continue
                 if msg is None:
                     break
                 kind = msg.get("kind", "state")
                 data = msg.get("data", {})
                 yield f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            return
         finally:
             AUTO_LOOP.unsubscribe(q)
 
@@ -616,4 +802,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("webui.app:app", host="127.0.0.1", port=8765, reload=False)
+    uvicorn.run(
+        "webui.app:app",
+        host="127.0.0.1",
+        port=8765,
+        reload=False,
+        timeout_keep_alive=1,
+        timeout_graceful_shutdown=2,
+    )

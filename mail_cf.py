@@ -19,10 +19,16 @@ import re
 import string
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# CF API 的 created_at 目前只有秒级精度；issued_after 是 time.time() 的浮点秒。
+# 同一秒内投递的邮件会显示成整秒时间，需要保留 1 秒边界余量避免误判为旧邮件。
+_MAIL_TIME_GRACE_SECONDS = 1.0
 
 
 def _gen_local_part(rng: Optional[random.Random] = None, length: int = 10) -> str:
@@ -68,6 +74,38 @@ def _extract_otp(raw: str, code_pattern: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _mail_created_ts(mail: dict) -> Optional[float]:
+    """尽量把邮件时间转成 epoch 秒。
+
+    CF `/admin/mails` 当前会返回 `created_at=YYYY-MM-DD HH:MM:SS`（UTC）。
+    """
+    raw = (mail or {}).get("created_at")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            dt = datetime.strptime(text.rstrip("Z"), fmt)
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_mail_older_than_issued_after(mail_ts: Optional[float], baseline_ts: Optional[float]) -> bool:
+    if baseline_ts is None or mail_ts is None:
+        return False
+    return mail_ts < (baseline_ts - _MAIL_TIME_GRACE_SECONDS)
+
+
 class CFTempEmailProvider:
     """Cloudflare Worker 自建临时邮箱 provider。
 
@@ -88,6 +126,7 @@ class CFTempEmailProvider:
         admin_token: str = "",
         domain: str = "",
         session=None,
+        enable_prefix: bool = True,
     ):
         if not api_url:
             raise ValueError("api_url 不能为空")
@@ -96,6 +135,7 @@ class CFTempEmailProvider:
         self.api_url = api_url.rstrip("/")
         self.admin_token = admin_token
         self.domain = domain
+        self.enable_prefix = bool(enable_prefix)
         self._jwt: str = ""
         self._current_email: str = ""
         self._seen_mail_ids: set = set()
@@ -104,6 +144,8 @@ class CFTempEmailProvider:
         self.last_persona = None
         self._outlook_creds = None
         self.outlook_exhausted = False
+        self.is_cf_temp = True
+        self.cancel_event = None
 
         # 用 curl_cffi 模拟 Chrome 指纹，过 CF Bot Fight Mode
         if session is not None:
@@ -150,7 +192,6 @@ class CFTempEmailProvider:
 
         # urllib 兜底
         if params:
-            import urllib.parse
             qs = urllib.parse.urlencode(params)
             url = f"{url}?{qs}"
         body = _json.dumps(json_body).encode() if json_body is not None else None
@@ -191,7 +232,7 @@ class CFTempEmailProvider:
         """
         local = _gen_local_part(self._rng, length=10)
         payload = {
-            "enablePrefix": True,
+            "enablePrefix": self.enable_prefix,
             "name": local,
             "domain": self.domain,
         }
@@ -254,7 +295,16 @@ class CFTempEmailProvider:
         """
         timeout = max(int(timeout), 60)
         deadline = time.time() + timeout
-        logger.info(f"[cf_temp] 等待 OTP -> {email_addr} (timeout={timeout}s)")
+        baseline_ts = float(issued_after or 0.0) if issued_after else None
+        logger.info(
+            f"[cf_temp] 等待 OTP -> {email_addr} "
+            f"(timeout={timeout}s, issued_after={baseline_ts or 'N/A'})"
+        )
+
+        seen_mail_ids: set[str] = set()
+        started_at = time.time()
+        poll_count = 0
+        last_summary_at = 0.0
 
         # 起始 seen_ids：当前邮箱里已有的邮件 id（避免被旧邮件污染）
         # issued_after=None 表示从现在开始等
@@ -262,25 +312,54 @@ class CFTempEmailProvider:
             initial_mails = self._get_mails(email_addr)
             for m in initial_mails:
                 mid = str(m.get("id", ""))
-                if mid:
-                    self._seen_mail_ids.add(mid)
-            logger.debug(f"[cf_temp] 初始已有邮件 {len(self._seen_mail_ids)} 封，跳过")
+                if not mid:
+                    continue
+                mail_ts = _mail_created_ts(m)
+                if _is_mail_older_than_issued_after(mail_ts, baseline_ts):
+                    seen_mail_ids.add(mid)
+            logger.debug(f"[cf_temp] 初始已有旧邮件 {len(seen_mail_ids)} 封，跳过")
         except Exception as e:
             logger.warning(f"[cf_temp] 初始邮件列表拉取异常: {e}")
 
         while time.time() < deadline:
+            cancel_event = getattr(self, "cancel_event", None)
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("registration_cancelled: 用户停止当前注册")
             try:
                 mails = self._get_mails(email_addr)
+                poll_count += 1
+                now = time.time()
+                if not mails and (poll_count == 1 or now - last_summary_at >= 30):
+                    last_summary_at = now
+                    logger.info(
+                        f"[cf_temp] poll mails=0 -> {email_addr} "
+                        f"(elapsed={int(now - started_at)}s)"
+                    )
+                elif mails and (poll_count == 1 or now - last_summary_at >= 30):
+                    last_summary_at = now
+                    preview = [
+                        f"id={m.get('id')} created_at={m.get('created_at', '')}"
+                        for m in sorted(mails, key=lambda x: x.get("id", 0), reverse=True)[:3]
+                    ]
+                    logger.info(
+                        f"[cf_temp] poll mails={len(mails)} -> {email_addr} "
+                        f"(elapsed={int(now - started_at)}s, latest={'; '.join(preview)})"
+                    )
                 # 按 id 倒序：最新的邮件优先
                 for mail in sorted(mails, key=lambda x: x.get("id", 0), reverse=True):
                     mid = str(mail.get("id", ""))
-                    if not mid or mid in self._seen_mail_ids:
+                    if not mid or mid in seen_mail_ids:
                         continue
-                    self._seen_mail_ids.add(mid)
+
+                    mail_ts = _mail_created_ts(mail)
+                    if _is_mail_older_than_issued_after(mail_ts, baseline_ts):
+                        seen_mail_ids.add(mid)
+                        continue
 
                     raw = str(mail.get("raw") or "")
                     otp = _extract_otp(raw)
                     if otp:
+                        seen_mail_ids.add(mid)
                         logger.info(
                             f"[cf_temp] ✅ OTP={otp} from mail id={mid} "
                             f"raw_len={len(raw)}"
@@ -289,11 +368,15 @@ class CFTempEmailProvider:
                     # 没匹配到也记日志便于排查
                     logger.debug(
                         f"[cf_temp] mail id={mid} 未匹配到 OTP "
-                        f"(subject={mail.get('subject','')[:50]})"
+                        f"(created_at={mail.get('created_at','')} subject={mail.get('subject','')[:50]})"
                     )
             except Exception as e:
                 logger.warning(f"[cf_temp] poll 异常 (吃掉重试): {e}")
-            time.sleep(3)
+            for _ in range(30):
+                cancel_event = getattr(self, "cancel_event", None)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("registration_cancelled: 用户停止当前注册")
+                time.sleep(0.1)
 
         raise TimeoutError(f"CFTempEmail OTP timeout {timeout}s for {email_addr}")
 
