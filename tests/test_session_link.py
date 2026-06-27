@@ -629,6 +629,92 @@ class SessionLinkApiTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("PayPal 长链接 US/USD", result["modes"])
 
+    def test_import_registered_api_uses_account_controller(self):
+        req = web_app.SessionLinkImportRegisteredReq(emails=["a@example.com"])
+        expected = {"ok": True, "imported": 1}
+
+        with patch.object(web_app.session_link.CONTROLLER, "import_registered", return_value=expected) as mocked:
+            result = web_app.api_session_link_import_registered(req)
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with(["a@example.com"])
+
+    def test_accounts_api_uses_account_controller(self):
+        expected = {"ok": True, "items": [{"email": "a@example.com"}]}
+
+        with patch.object(web_app.session_link.CONTROLLER, "accounts", return_value=expected) as mocked:
+            result = web_app.api_session_link_accounts(status="pending", limit=25)
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with(status="pending", limit=25)
+
+    def test_run_selected_api_uses_account_controller(self):
+        req = web_app.SessionLinkRunSelectedReq(
+            emails=["a@example.com"],
+            payment_mode="PayPal 长链接 US/USD",
+            target_amount="20",
+            proxy_pool="http://proxy.example:8080",
+            delay_seconds=3,
+            stop_after=2,
+        )
+        expected = {"ok": True, "running": True}
+
+        with patch.object(web_app.session_link.CONTROLLER, "run_selected", return_value=expected) as mocked:
+            result = web_app.api_session_link_run_selected(req)
+
+        self.assertEqual(result, expected)
+        payload = mocked.call_args.args[0]
+        self.assertEqual(payload["emails"], ["a@example.com"])
+        self.assertEqual(payload["payment_mode"], "PayPal 长链接 US/USD")
+        self.assertEqual(payload["target_amount"], "20")
+        self.assertEqual(payload["proxy_pool"], "http://proxy.example:8080")
+        self.assertEqual(payload["delay_seconds"], 3)
+        self.assertEqual(payload["stop_after"], 2)
+
+    def test_account_stop_api_uses_account_controller(self):
+        expected = {"ok": True, "running": False}
+        route = next(
+            item for item in web_app.app.routes
+            if getattr(item, "path", "") == "/api/session-link/accounts/stop"
+        )
+
+        self.assertIs(route.endpoint, web_app.api_session_link_stop)
+
+        with patch.object(web_app.session_link.CONTROLLER, "stop", return_value=expected) as mocked:
+            result = route.endpoint()
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with()
+
+    def test_reset_api_uses_account_controller(self):
+        req = web_app.SessionLinkEmailListReq(emails=["a@example.com"])
+        expected = {"ok": True, "reset": 1}
+
+        with patch.object(web_app.session_link.CONTROLLER, "reset", return_value=expected) as mocked:
+            result = web_app.api_session_link_reset(req)
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with(["a@example.com"])
+
+    def test_delete_api_uses_account_controller(self):
+        req = web_app.SessionLinkEmailListReq(emails=["a@example.com"])
+        expected = {"ok": True, "deleted": 1}
+
+        with patch.object(web_app.session_link.CONTROLLER, "delete", return_value=expected) as mocked:
+            result = web_app.api_session_link_delete(req)
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with(["a@example.com"])
+
+    def test_logs_api_uses_account_controller(self):
+        expected = {"ok": True, "items": [{"stage": "create_checkout"}]}
+
+        with patch.object(web_app.session_link.CONTROLLER, "logs", return_value=expected) as mocked:
+            result = web_app.api_session_link_logs("a@example.com")
+
+        self.assertEqual(result, expected)
+        mocked.assert_called_once_with("a@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()
