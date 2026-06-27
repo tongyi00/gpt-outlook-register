@@ -430,6 +430,11 @@ def opll_random_postal_code(pattern: str) -> str:
     return "".join(result)
 
 
+def _emit_stage(callback, stage: str, message: str = "") -> None:
+    if callback:
+        callback(stage, message)
+
+
 # ===================================================================
 # Proxy helpers
 # ===================================================================
@@ -1288,7 +1293,8 @@ def opll_combo_attempt_order(country: str) -> list[tuple[str, str]]:
 # ===================================================================
 
 def generate_opll_paypal_long_link(access_token: str, country: str, currency: str,
-                                    proxy_url: str = "", target_amount="0") -> dict:
+                                    proxy_url: str = "", target_amount="0",
+                                    stage_callback=None) -> dict:
     """
     Generate a PayPal BA approve long link from a ChatGPT access token.
     This is used for modes like "PayPal 长链接 US/USD" and "PayPal 长链接 FR/EUR".
@@ -1297,9 +1303,11 @@ def generate_opll_paypal_long_link(access_token: str, country: str, currency: st
     requested_country = normalize_opll_country(country)
     for checkout_country, pm_country in opll_combo_attempt_order(requested_country):
         try:
+            _emit_stage(stage_callback, "create_checkout")
             checkout = opll_create_checkout(access_token, checkout_country,
                                              currency_for_country(checkout_country), proxy_url)
             stripe = opll_build_stripe_session(proxy_url)
+            _emit_stage(stage_callback, "stripe_init")
             init_payload = opll_stripe_init(checkout["cs_id"], checkout["billing_country"],
                                              checkout["currency"], proxy_url,
                                              stripe=stripe, checkout=checkout)
@@ -1314,6 +1322,7 @@ def generate_opll_paypal_long_link(access_token: str, country: str, currency: st
                 ctx["currency"] = str(checkout.get("currency") or "").lower()
             stripe_amount, stripe_amount_source = opll_stripe_amount_info(init_payload)
             opll_validate_amount_or_raise(stripe_amount, stripe_amount_source, target_amount)
+            _emit_stage(stage_callback, "paypal_approve")
             pm_id = opll_stripe_create_paypal_method(stripe, checkout["cs_id"], ctx,
                                                       opll_billing_for_country(pm_country), stripe_pk)
             confirm_payload = opll_stripe_confirm(stripe, checkout["cs_id"], pm_id, stripe_pk,
@@ -1352,12 +1361,14 @@ def generate_opll_paypal_long_link(access_token: str, country: str, currency: st
 
 
 def generate_opll_hosted_long_link(access_token: str, country: str, currency: str,
-                                    proxy_url: str = "") -> dict:
+                                    proxy_url: str = "", stage_callback=None) -> dict:
     """
     Generate a hosted Stripe checkout URL (no card / GoPay / Apple Pay).
     Used for modes like "无卡长链接 US/USD", "GoPay 长链接 ID/IDR", etc.
     """
+    _emit_stage(stage_callback, "create_checkout")
     checkout = opll_create_checkout(access_token, country, currency, proxy_url)
+    _emit_stage(stage_callback, "stripe_init")
     init_payload = opll_stripe_init(checkout["cs_id"], checkout["billing_country"],
                                      checkout["currency"], proxy_url, checkout=checkout)
     stripe_hosted_url = str(init_payload.get("stripe_hosted_url") or "").strip()
@@ -1374,7 +1385,8 @@ def generate_opll_hosted_long_link(access_token: str, country: str, currency: st
 # ===================================================================
 
 def generate_payment_link(access_token: str, mode: str = "无卡长链接 US/USD",
-                           proxy_url: str = "", target_amount="0") -> dict:
+                           proxy_url: str = "", target_amount="0",
+                           stage_callback=None) -> dict:
     """
     Generate a ChatGPT Plus payment link from an access token (Session).
 
@@ -1396,6 +1408,7 @@ def generate_payment_link(access_token: str, mode: str = "无卡长链接 US/USD
               - "Apple Pay 支付页 JP/JPY"
         proxy_url: Optional HTTP proxy URL, e.g. "http://127.0.0.1:7890".
         target_amount: Expected Stripe minor-unit amount for PayPal links.
+        stage_callback: Optional callback invoked as each payment generation stage starts.
 
     Returns:
         dict with keys: long_url, cs_id, billing_country, currency,
@@ -1415,10 +1428,12 @@ def generate_payment_link(access_token: str, mode: str = "无卡长链接 US/USD
     apple_pay_hosted = bool(mode_config.get("apple_pay_hosted"))
 
     if is_paypal:
-        result = generate_opll_paypal_long_link(token, country, currency, proxy_url, target_amount)
+        result = generate_opll_paypal_long_link(
+            token, country, currency, proxy_url, target_amount, stage_callback=stage_callback)
     else:
         # 无卡长链接 / GoPay / Apple Pay — all use hosted
-        result = generate_opll_hosted_long_link(token, country, currency, proxy_url)
+        result = generate_opll_hosted_long_link(token, country, currency, proxy_url,
+                                                stage_callback=stage_callback)
 
     return {
         "success": True,

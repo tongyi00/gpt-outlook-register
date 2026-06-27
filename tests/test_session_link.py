@@ -2,8 +2,71 @@ import time
 import unittest
 from unittest.mock import patch
 
+from session_link_gen import core as session_link_core
 from webui import app as web_app
 from webui.session_link import SessionLinkController, result_error
+
+
+class TestPaymentLinkCoreStages(unittest.TestCase):
+    def fake_checkout(self):
+        return {
+            "cs_id": "cs_test_123",
+            "processor_entity": "openai_llc",
+            "stripe_publishable_key": "pk_live_test",
+            "billing_country": "US",
+            "currency": "USD",
+        }
+
+    def fake_init_payload(self):
+        return {
+            "stripe_hosted_url": "https://checkout.stripe.com/c/pay/cs_test_123",
+            "total_summary": {"due": "0"},
+            "currency": "usd",
+            "config_id": "cfg_test",
+            "init_checksum": "checksum_test",
+        }
+
+    def test_paypal_mode_emits_payment_generation_stages_in_order(self):
+        stages = []
+
+        def callback(stage, message=""):
+            stages.append(stage)
+
+        with patch.object(session_link_core, "opll_create_checkout", return_value=self.fake_checkout()), \
+                patch.object(session_link_core, "opll_build_stripe_session", return_value=object()), \
+                patch.object(session_link_core, "opll_stripe_init", return_value=self.fake_init_payload()), \
+                patch.object(session_link_core, "opll_stripe_create_paypal_method", return_value="pm_test"), \
+                patch.object(session_link_core, "opll_stripe_confirm", return_value={}), \
+                patch.object(
+                    session_link_core,
+                    "opll_redirect_url_after_confirm",
+                    return_value="https://www.paypal.com/agreements/approve?ba_token=BA-test",
+                ):
+            result = session_link_core.generate_payment_link(
+                "token",
+                mode="PayPal 长链接 US/USD",
+                stage_callback=callback,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(stages, ["create_checkout", "stripe_init", "paypal_approve"])
+
+    def test_hosted_mode_emits_checkout_and_stripe_init_stages_only(self):
+        stages = []
+
+        def callback(stage, message=""):
+            stages.append(stage)
+
+        with patch.object(session_link_core, "opll_create_checkout", return_value=self.fake_checkout()), \
+                patch.object(session_link_core, "opll_stripe_init", return_value=self.fake_init_payload()):
+            result = session_link_core.generate_payment_link(
+                "token",
+                mode="无卡长链接 US/USD",
+                stage_callback=callback,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(stages, ["create_checkout", "stripe_init"])
 
 
 class SessionLinkControllerTests(unittest.TestCase):
@@ -77,4 +140,3 @@ class SessionLinkApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
