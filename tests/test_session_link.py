@@ -438,26 +438,52 @@ class SessionLinkControllerAccountTests(unittest.TestCase):
         self.with_db(run)
 
     def test_unhandled_account_worker_exception_marks_batch_failed(self):
-        controller = SessionLinkController()
+        def run():
+            controller = SessionLinkController()
+            self.save_registered_and_import()
 
-        with patch.object(controller, "_run_account_loop", side_effect=RuntimeError("worker exploded")):
-            result = controller.run_selected({
-                "emails": ["a@example.com"],
-                "payment_mode": "PayPal 长链接 US/USD",
-                "delay_seconds": 0,
-            })
-            self.assertTrue(result["ok"])
-            self.wait_for_batch(controller)
+            with patch.object(controller, "_run_account_loop", side_effect=RuntimeError("worker exploded")):
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+                self.assertTrue(result["ok"])
+                self.wait_for_batch(controller)
 
-        with controller._lock:
-            state = dict(controller._account_state)
-        self.assertFalse(state["running"])
-        self.assertEqual(state["status"], "failed")
-        self.assertIn("worker exploded", state["last_error"])
-        public_state = controller.status()
-        self.assertFalse(public_state["running"])
-        self.assertEqual(public_state["status"], "failed")
-        self.assertIn("worker exploded", public_state["last_error"])
+            with controller._lock:
+                state = dict(controller._account_state)
+            self.assertFalse(state["running"])
+            self.assertEqual(state["status"], "failed")
+            self.assertIn("worker exploded", state["last_error"])
+            public_state = controller.status()
+            self.assertFalse(public_state["running"])
+            self.assertEqual(public_state["status"], "failed")
+            self.assertIn("worker exploded", public_state["last_error"])
+
+        self.with_db(run)
+
+    def test_run_selected_rejects_accounts_not_imported_to_workbench(self):
+        def run():
+            controller = SessionLinkController()
+            db.save_registered({"email": "a@example.com", "access_token": "token-a"})
+
+            with patch("webui.session_link.generate_payment_link") as mocked:
+                result = controller.run_selected({
+                    "emails": ["a@example.com"],
+                    "payment_mode": "PayPal 长链接 US/USD",
+                    "delay_seconds": 0,
+                })
+
+            self.assertFalse(result["ok"])
+            self.assertIn("未导入", result["error"])
+            mocked.assert_not_called()
+            with controller._lock:
+                self.assertFalse(controller._account_state["running"])
+            registered = db.get_registered("a@example.com")
+            self.assertFalse(registered["payment_link"])
+
+        self.with_db(run)
 
     def test_run_selected_marks_missing_token_account(self):
         def run():

@@ -259,6 +259,16 @@ class SessionLinkController:
         with self._lock:
             if self._state.get("running") or self._account_state.get("running"):
                 return {"ok": False, "error": "链接生成循环正在运行"}
+            missing_accounts = [
+                email for email in emails
+                if not db.get_session_link_account(email)
+            ]
+            if missing_accounts:
+                return {
+                    "ok": False,
+                    "error": "账号未导入链接生成: " + ", ".join(missing_accounts[:5]),
+                    "missing": missing_accounts,
+                }
             self._account_stop = threading.Event()
             config = self._build_account_config(payload, emails)
             self._account_state = self._initial_account_state()
